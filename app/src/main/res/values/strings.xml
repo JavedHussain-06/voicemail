@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">Live Voicemail</string>
+    <string name="tab_voicemail">Voicemail</string>
+    <string name="tab_recents">Recents</string>
+    <string name="tab_dialpad">Keypad</string>
+    <string name="incoming_call">Incoming Call</string>
+    <string name="playing_greeting">Greeting Caller…</string>
+    <string name="live_voicemail">Live Voicemail</string>
+    <string name="active_call">Active Call</string>
+    <string name="call_ended">Call Ended</string>
+    <string name="button_voicemail">Voicemail</string>
+    <string name="button_screen_call">Screen Call</string>
+    <string name="button_pickup">Pick Up</string>
+    <string name="button_answer">Answer</string>
+    <string name="button_end_call">End Call</string>
+    <string name="button_speaker">Speaker</string>
+    <string name="button_mute">Mute</string>
+    <string name="button_keypad">Keypad</string>
+    <string name="button_hold">Hold</string>
+    <string name="button_unhold">Unhold</string>
+    <string name="button_add_call">Add Call</string>
+    <string name="button_merge_calls">Merge Calls</string>
+    <string name="button_swap_calls">Swap Calls</string>
+    <string name="outgoing_calling">Calling…</string>
+    <string name="on_hold">On Hold</string>
+    <string name="notification_channel_incall">Active &amp; Incoming Calls</string>
+    <string name="notification_channel_voicemail">Live Voicemail Recordings</string>
+</resources>

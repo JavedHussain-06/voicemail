@@ -1,0 +1,32 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/*/build
+.kotlin
+
+# Built APKs, AARs, native build artifacts
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Local binaries and downloads
+model.tar.bz2
+sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/
+shizuku.apk
+
+# Temporary artifacts and device screenshots
+dialog.png
+dup_error.txt
+greeting_test.wav
+screen_*.png
+
+# Keystore files
+*.jks
+*.keystore
+
+# Google Services / secrets
+google-services.json
