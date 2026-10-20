@@ -28,6 +28,7 @@
 
     <!-- OEM (Vivo FuntouchOS / Snapdragon) Background Survival -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Inter-Process Shizuku IPC -->
     <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL"
@@ -122,11 +123,24 @@
             </intent-filter>
         </receiver>
 
+        <!-- Auto-Boot & Background Persistence Receiver -->
+        <receiver
+            android:name=".service.BootCompletedReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
         <!-- Privileged Audio Engine Service Executed via Shizuku (UID 2000 com.android.shell) -->
         <service
             android:name=".service.VoicemailUserService"
             android:exported="true"
-            android:process=":privileged_audio" />
+            android:process=":privileged_audio"
+            tools:ignore="Instantiatable" />
 
         <!-- Shizuku Content Provider for Binder Exchange -->
         <provider

@@ -1,9 +1,9 @@
 package com.personal.voicemail.ui.screens
 
-import android.app.Activity
 import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PhoneInTalk
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -60,15 +61,13 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.personal.voicemail.VoicemailApplication
 import com.personal.voicemail.ui.components.GlassmorphicCard
 import com.personal.voicemail.ui.theme.AccentBlue
 import com.personal.voicemail.ui.theme.CallAcceptGreen
-import com.personal.voicemail.ui.theme.CallEndRed
 import com.personal.voicemail.ui.theme.GlassBorder
 import com.personal.voicemail.ui.theme.TextPrimary
 import com.personal.voicemail.ui.theme.TextSecondary
-
-import com.personal.voicemail.VoicemailApplication
 
 @Composable
 fun SystemReadinessBanner(
@@ -80,7 +79,11 @@ fun SystemReadinessBanner(
     var isRuntimePermsGranted by remember { mutableStateOf(checkRuntimePermissions(context)) }
     var isAccessibilityEnabled by remember { mutableStateOf(checkAccessibilityServiceEnabled(context)) }
     var isShizukuReady by remember { mutableStateOf(VoicemailApplication.shizukuController.updateShizukuStatus()) }
-    var isExpanded by remember { mutableStateOf(false) }
+
+    // Standalone Primary Mode: Shizuku is NOT required for allReady!
+    val allReady = isDefaultDialer && isBatteryExempt && isRuntimePermsGranted && isAccessibilityEnabled
+
+    var isExpanded by remember { mutableStateOf(!allReady) }
 
     val roleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         isDefaultDialer = checkDefaultDialerRole(context)
@@ -115,7 +118,28 @@ fun SystemReadinessBanner(
         isShizukuReady = VoicemailApplication.shizukuController.updateShizukuStatus()
     }
 
-    val allReady = isDefaultDialer && isBatteryExempt && isRuntimePermsGranted && isAccessibilityEnabled && isShizukuReady
+    val runOneTapSetup: () -> Unit = {
+        if (!isRuntimePermsGranted) {
+            val perms = mutableListOf(
+                android.Manifest.permission.CALL_PHONE,
+                android.Manifest.permission.READ_PHONE_STATE,
+                android.Manifest.permission.READ_CALL_LOG,
+                android.Manifest.permission.WRITE_CALL_LOG,
+                android.Manifest.permission.READ_CONTACTS,
+                android.Manifest.permission.RECORD_AUDIO
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+            permsLauncher.launch(perms.toTypedArray())
+        } else if (!isDefaultDialer) {
+            requestDefaultDialerRole(context, roleLauncher)
+        } else if (!isBatteryExempt) {
+            requestBatteryExemption(context)
+        } else if (!isAccessibilityEnabled) {
+            openAccessibilitySettings(context)
+        }
+    }
 
     GlassmorphicCard(
         modifier = modifier.fillMaxWidth(),
@@ -134,7 +158,10 @@ fun SystemReadinessBanner(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(
                         imageVector = if (allReady) Icons.Default.CheckCircle else Icons.Default.Warning,
                         contentDescription = null,
@@ -144,13 +171,13 @@ fun SystemReadinessBanner(
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = if (allReady) "System Ready for Live Voicemail" else "Setup Required for Live Voicemail",
+                            text = if (allReady) "Live Voicemail Active" else "Setup Required for Live Voicemail",
                             fontSize = 15.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = TextPrimary
                         )
                         Text(
-                            text = if (allReady) "Standalone Single-APK • Offline Live Voicemail Active" else "Tap to review required system permissions",
+                            text = if (allReady) "100% Standalone • Ready to screen incoming calls" else "Tap below to grant permissions and activate",
                             fontSize = 12.sp,
                             color = TextSecondary
                         )
@@ -165,8 +192,35 @@ fun SystemReadinessBanner(
                 )
             }
 
+            // Master "One-Tap Allow All Setup" Button shown when not all permissions are ready
+            if (!allReady) {
+                Spacer(modifier = Modifier.height(14.dp))
+                Button(
+                    onClick = runOneTapSetup,
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Allow Permissions & Activate App",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+            }
+
             AnimatedVisibility(
-                visible = isExpanded || !allReady,
+                visible = isExpanded,
                 enter = expandVertically(),
                 exit = shrinkVertically()
             ) {
@@ -194,12 +248,7 @@ fun SystemReadinessBanner(
                         isComplete = isAccessibilityEnabled,
                         icon = Icons.Default.Accessibility,
                         onAction = {
-                            try {
-                                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                                context.startActivity(intent)
-                            } catch (t: Throwable) {
-                                android.util.Log.e("SystemReadiness", "Failed opening accessibility settings", t)
-                            }
+                            openAccessibilitySettings(context)
                         }
                     )
 
@@ -221,31 +270,35 @@ fun SystemReadinessBanner(
                         isComplete = isRuntimePermsGranted,
                         icon = Icons.Default.PhoneInTalk,
                         onAction = {
-                            permsLauncher.launch(
-                                arrayOf(
-                                    android.Manifest.permission.CALL_PHONE,
-                                    android.Manifest.permission.READ_PHONE_STATE,
-                                    android.Manifest.permission.READ_CALL_LOG,
-                                    android.Manifest.permission.WRITE_CALL_LOG,
-                                    android.Manifest.permission.READ_CONTACTS,
-                                    android.Manifest.permission.RECORD_AUDIO,
-                                    android.Manifest.permission.POST_NOTIFICATIONS
-                                )
+                            val perms = mutableListOf(
+                                android.Manifest.permission.CALL_PHONE,
+                                android.Manifest.permission.READ_PHONE_STATE,
+                                android.Manifest.permission.READ_CALL_LOG,
+                                android.Manifest.permission.WRITE_CALL_LOG,
+                                android.Manifest.permission.READ_CONTACTS,
+                                android.Manifest.permission.RECORD_AUDIO
                             )
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            permsLauncher.launch(perms.toTypedArray())
                         }
                     )
 
-                    // Item 5: Privileged Telephony Audio (Shizuku)
+                    // Item 5: Audio Engine Status (Standalone or Privileged)
                     ReadinessItem(
-                        title = "Privileged Audio Pipeline (Shizuku)",
-                        subtitle = if (isShizukuReady) "UID 2000 authorized • Silent uplink greeting & downlink capture active"
-                        else "Tap to authorize Shizuku for silent greeting injection & audio capture",
-                        isComplete = isShizukuReady,
+                        title = if (isShizukuReady) "Audio Engine: Enhanced UID 2000 Mode (Active)"
+                        else "Audio Engine: Standalone In-Process Telephony Engine (Active)",
+                        subtitle = if (isShizukuReady) "UID 2000 privileged mode enabled • Direct digital uplink injection active"
+                        else "100% Standalone mode active • No PC or Shizuku app required",
+                        isComplete = true,
                         icon = Icons.Default.PhoneInTalk,
                         onAction = {
-                            VoicemailApplication.shizukuController.requestShizukuPermission()
-                            VoicemailApplication.shizukuController.bindUserService()
-                            isShizukuReady = VoicemailApplication.shizukuController.updateShizukuStatus()
+                            if (!isShizukuReady) {
+                                VoicemailApplication.shizukuController.requestShizukuPermission()
+                                VoicemailApplication.shizukuController.bindUserService()
+                                isShizukuReady = VoicemailApplication.shizukuController.updateShizukuStatus()
+                            }
                         }
                     )
 
@@ -259,7 +312,9 @@ fun SystemReadinessBanner(
                             )
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0x33007AFF)),
-                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
                     ) {
                         Text(
                             text = "Test Voicemail Pipeline (Self-Test)",
@@ -382,15 +437,19 @@ private fun requestBatteryExemption(context: Context) {
 }
 
 private fun checkRuntimePermissions(context: Context): Boolean {
-    val permissions = listOf(
+    val permissions = mutableListOf(
         android.Manifest.permission.CALL_PHONE,
         android.Manifest.permission.READ_PHONE_STATE,
         android.Manifest.permission.READ_CALL_LOG,
+        android.Manifest.permission.WRITE_CALL_LOG,
         android.Manifest.permission.READ_CONTACTS,
         android.Manifest.permission.RECORD_AUDIO
     )
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        permissions.add(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
     return permissions.all {
-        ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
 }
 
@@ -402,4 +461,15 @@ private fun checkAccessibilityServiceEnabled(context: Context): Boolean {
         Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
     ) ?: return false
     return enabledServices.contains(expected) || enabledServices.contains(expectedShort)
+}
+
+private fun openAccessibilitySettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (t: Throwable) {
+        android.util.Log.e("SystemReadiness", "Failed opening accessibility settings", t)
+    }
 }

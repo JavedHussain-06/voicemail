@@ -107,7 +107,7 @@ class LiveVoicemailTranscriber(
      * Copies model files from assets to internal storage and passes absolute paths
      * with assetManager = null to prevent AAssetManager native crashes on Android 14/15.
      */
-    private fun initializeRecognizer() {
+    fun initializeRecognizer() {
         transcriberScope.launch(Dispatchers.IO) {
             try {
                 Log.d(TAG, "Starting Sherpa-ONNX Zipformer model extraction and initialization...")
