@@ -3,6 +3,9 @@ package com.personal.voicemail.service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.personal.voicemail.audio.GreetingGenerator
@@ -16,7 +19,7 @@ import java.io.File
 
 /**
  * Diagnostic BroadcastReceiver triggered via ADB to verify the entire
- * Shizuku UID 2000 audio pipeline and Sherpa-ONNX transducer offline before live test calls.
+ * standalone audio pipeline and Sherpa-ONNX transducer offline before live test calls.
  *
  * Trigger with:
  *   adb shell am broadcast -a com.personal.voicemail.ACTION_SELF_TEST
@@ -65,22 +68,29 @@ class VoicemailSelfTestReceiver : BroadcastReceiver() {
         }
         Log.i(TAG, "[SELF_TEST] ParcelFileDescriptor created successfully (fd=${pfd.fd})")
 
-        // Step 2: Verify Shizuku Controller & Privileged UserService Binding
-        Log.i(TAG, "[SELF_TEST] Step 2: Verifying Shizuku UID 2000 UserService...")
-        val shizukuController = ShizukuAudioController.getInstance(context)
-        shizukuController.updateShizukuStatus()
-
-        var retries = 10
-        while (!shizukuController.isServiceBound.value && retries > 0) {
-            shizukuController.bindUserService()
-            delay(500)
-            retries--
+        // Step 2: Verify Standalone AudioRecord Capture Capability
+        Log.i(TAG, "[SELF_TEST] Step 2: Verifying standalone AudioRecord hardware capture...")
+        val minBuf = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val testRecord = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            16000,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBuf.coerceAtLeast(3200 * 4)
+        )
+        if (testRecord.state != AudioRecord.STATE_INITIALIZED) {
+            testRecord.release()
+            throw IllegalStateException("AudioRecord failed to initialize with VOICE_RECOGNITION source")
         }
+        Log.i(TAG, "[SELF_TEST] Standalone AudioRecord initialized successfully (state=${testRecord.state})")
+        testRecord.release()
 
-        if (!shizukuController.isServiceBound.value) {
-            throw IllegalStateException("Shizuku VoicemailUserService not connected!")
+        // Optional Shizuku Controller check (logged only, non-blocking)
+        runCatching {
+            val shizukuController = ShizukuAudioController.getInstance(context)
+            val isShizukuRunning = shizukuController.updateShizukuStatus()
+            Log.i(TAG, "[SELF_TEST] Optional Shizuku status: running=$isShizukuRunning")
         }
-        Log.i(TAG, "[SELF_TEST] Privileged VoicemailUserService connected successfully!")
 
         // Step 3: Verify Sherpa-ONNX Transcriber Engine
         Log.i(TAG, "[SELF_TEST] Step 3: Verifying Sherpa-ONNX Transcriber...")

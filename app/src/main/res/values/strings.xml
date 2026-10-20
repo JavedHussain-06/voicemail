@@ -25,4 +25,5 @@
     <string name="on_hold">On Hold</string>
     <string name="notification_channel_incall">Active &amp; Incoming Calls</string>
     <string name="notification_channel_voicemail">Live Voicemail Recordings</string>
+    <string name="accessibility_service_description">Ensures uninterrupted Live Voicemail screening and audio recording on Vivo FuntouchOS.</string>
 </resources>

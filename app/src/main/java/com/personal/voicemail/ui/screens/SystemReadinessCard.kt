@@ -29,20 +29,20 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Accessibility
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PhoneInTalk
-import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -53,11 +53,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.personal.voicemail.service.ShizukuAudioController
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.personal.voicemail.ui.components.GlassmorphicCard
 import com.personal.voicemail.ui.theme.AccentBlue
 import com.personal.voicemail.ui.theme.CallAcceptGreen
@@ -66,19 +68,18 @@ import com.personal.voicemail.ui.theme.GlassBorder
 import com.personal.voicemail.ui.theme.TextPrimary
 import com.personal.voicemail.ui.theme.TextSecondary
 
+import com.personal.voicemail.VoicemailApplication
+
 @Composable
 fun SystemReadinessBanner(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val shizukuController = remember { ShizukuAudioController.getInstance(context) }
-
-    val isShizukuRunning by shizukuController.isShizukuInstalledAndRunning.collectAsState()
-    val isShizukuPermGranted by shizukuController.isPermissionGranted.collectAsState()
-
     var isDefaultDialer by remember { mutableStateOf(checkDefaultDialerRole(context)) }
     var isBatteryExempt by remember { mutableStateOf(checkBatteryOptimizationExempt(context)) }
     var isRuntimePermsGranted by remember { mutableStateOf(checkRuntimePermissions(context)) }
+    var isAccessibilityEnabled by remember { mutableStateOf(checkAccessibilityServiceEnabled(context)) }
+    var isShizukuReady by remember { mutableStateOf(VoicemailApplication.shizukuController.updateShizukuStatus()) }
     var isExpanded by remember { mutableStateOf(false) }
 
     val roleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -89,14 +90,32 @@ fun SystemReadinessBanner(
         isRuntimePermsGranted = checkRuntimePermissions(context)
     }
 
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isDefaultDialer = checkDefaultDialerRole(context)
+                isBatteryExempt = checkBatteryOptimizationExempt(context)
+                isRuntimePermsGranted = checkRuntimePermissions(context)
+                isAccessibilityEnabled = checkAccessibilityServiceEnabled(context)
+                isShizukuReady = VoicemailApplication.shizukuController.updateShizukuStatus()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
     LaunchedEffect(Unit) {
-        shizukuController.updateShizukuStatus()
         isDefaultDialer = checkDefaultDialerRole(context)
         isBatteryExempt = checkBatteryOptimizationExempt(context)
         isRuntimePermsGranted = checkRuntimePermissions(context)
+        isAccessibilityEnabled = checkAccessibilityServiceEnabled(context)
+        isShizukuReady = VoicemailApplication.shizukuController.updateShizukuStatus()
     }
 
-    val allReady = isDefaultDialer && isShizukuRunning && isShizukuPermGranted && isBatteryExempt && isRuntimePermsGranted
+    val allReady = isDefaultDialer && isBatteryExempt && isRuntimePermsGranted && isAccessibilityEnabled && isShizukuReady
 
     GlassmorphicCard(
         modifier = modifier.fillMaxWidth(),
@@ -131,7 +150,7 @@ fun SystemReadinessBanner(
                             color = TextPrimary
                         )
                         Text(
-                            text = if (allReady) "Dialer active • UID 2000 connected" else "Tap to review required system permissions",
+                            text = if (allReady) "Standalone Single-APK • Offline Live Voicemail Active" else "Tap to review required system permissions",
                             fontSize = 12.sp,
                             color = TextSecondary
                         )
@@ -168,14 +187,19 @@ fun SystemReadinessBanner(
                         }
                     )
 
-                    // Item 2: Shizuku Privileged Shell (UID 2000)
+                    // Item 2: Background Audio Guardian (Accessibility)
                     ReadinessItem(
-                        title = "Shizuku Audio Engine (UID 2000)",
-                        subtitle = if (!isShizukuRunning) "Start Shizuku service via ADB or Wireless Debugging" else "Grants CAPTURE_AUDIO_OUTPUT to tap downlink",
-                        isComplete = isShizukuRunning && isShizukuPermGranted,
-                        icon = Icons.Default.Security,
+                        title = "Background Audio Guardian (Accessibility)",
+                        subtitle = if (isAccessibilityEnabled) "Service active • Microphone unlocked while locked" else "Tap to enable VoicemailAccessibilityService in Accessibility settings",
+                        isComplete = isAccessibilityEnabled,
+                        icon = Icons.Default.Accessibility,
                         onAction = {
-                            shizukuController.requestShizukuPermission()
+                            try {
+                                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                context.startActivity(intent)
+                            } catch (t: Throwable) {
+                                android.util.Log.e("SystemReadiness", "Failed opening accessibility settings", t)
+                            }
                         }
                     )
 
@@ -208,6 +232,20 @@ fun SystemReadinessBanner(
                                     android.Manifest.permission.POST_NOTIFICATIONS
                                 )
                             )
+                        }
+                    )
+
+                    // Item 5: Privileged Telephony Audio (Shizuku)
+                    ReadinessItem(
+                        title = "Privileged Audio Pipeline (Shizuku)",
+                        subtitle = if (isShizukuReady) "UID 2000 authorized • Silent uplink greeting & downlink capture active"
+                        else "Tap to authorize Shizuku for silent greeting injection & audio capture",
+                        isComplete = isShizukuReady,
+                        icon = Icons.Default.PhoneInTalk,
+                        onAction = {
+                            VoicemailApplication.shizukuController.requestShizukuPermission()
+                            VoicemailApplication.shizukuController.bindUserService()
+                            isShizukuReady = VoicemailApplication.shizukuController.updateShizukuStatus()
                         }
                     )
 
@@ -354,4 +392,14 @@ private fun checkRuntimePermissions(context: Context): Boolean {
     return permissions.all {
         ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
     }
+}
+
+private fun checkAccessibilityServiceEnabled(context: Context): Boolean {
+    val expected = "${context.packageName}/${com.personal.voicemail.service.VoicemailAccessibilityService::class.java.canonicalName}"
+    val expectedShort = "${context.packageName}/.service.VoicemailAccessibilityService"
+    val enabledServices = Settings.Secure.getString(
+        context.contentResolver,
+        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+    ) ?: return false
+    return enabledServices.contains(expected) || enabledServices.contains(expectedShort)
 }

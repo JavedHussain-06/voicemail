@@ -1,6 +1,5 @@
 package com.personal.voicemail.service
 
-import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
@@ -8,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -52,9 +52,9 @@ import kotlin.math.max
  * Telecom InCallService implementation holding RoleManager.ROLE_DIALER replacement duties.
  *
  * Intercepts incoming cellular calls across Dual-SIM slots, coordinates the 8-second
- * auto-screening timer, silently answers without room audio bleed, connects to the
- * privileged Shizuku VoicemailUserService, streams caller speech to Sherpa-ONNX, and
- * supports zero-latency mid-call Pick Up takeover with proximity screen-off management.
+ * auto-screening timer, silently answers without room audio bleed, mutes the local microphone
+ * so the caller cannot hear the user, injects the greeting via Shizuku UID 2000 into the
+ * cellular uplink, and streams caller downlink audio to Sherpa-ONNX.
  */
 class VoicemailInCallService : InCallService() {
 
@@ -86,6 +86,7 @@ class VoicemailInCallService : InCallService() {
     private val hasSavedCurrentSession = AtomicBoolean(false)
     private val chunksReceivedCount = AtomicInteger(0)
 
+    @Volatile
     private var isVoicemailScreeningActive = false
     private var inProcessGreetingPlayer: MediaPlayer? = null
     private var greetingTimeoutJob: Job? = null
@@ -129,31 +130,47 @@ class VoicemailInCallService : InCallService() {
                 }
             }
         }
-
-        override fun onDetailsChanged(call: Call?, details: Call.Details?) {
-            super.onDetailsChanged(call, details)
-        }
     }
 
+    /**
+     * Receives 16kHz caller downlink PCM chunks from the privileged Shizuku VoicemailUserService.
+     */
     private val audioChunkCallback = object : IAudioChunkCallback.Stub() {
         override fun onPcmChunkReceived(pcm16kHzBytes: ByteArray?) {
-            if (pcm16kHzBytes != null && isVoicemailScreeningActive) {
-                chunksReceivedCount.incrementAndGet()
+            if (pcm16kHzBytes != null && isVoicemailScreeningActive && isGreetingFinished.get()) {
+                val count = chunksReceivedCount.incrementAndGet()
                 val shortCount = pcm16kHzBytes.size / 2
                 val shortArray = ShortArray(shortCount)
                 ByteBuffer.wrap(pcm16kHzBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortArray)
+
+                // Boost quiet cellular downlink signal moderately without clipping
+                var peak = 0
+                for (i in shortArray.indices) {
+                    val boosted = (shortArray[i].toInt() * 2).coerceIn(-32768, 32767)
+                    val absVal = kotlin.math.abs(boosted)
+                    if (absVal > peak) peak = absVal
+                    shortArray[i] = boosted.toShort()
+                }
+                if (count <= 15 || count % 20 == 0) {
+                    Log.d(TAG, "Privileged downlink chunk #$count received (${pcm16kHzBytes.size}B, boostedPeak=$peak)")
+                }
                 transcriber.submitPcmChunk(shortArray)
             }
         }
 
         override fun onGreetingFinished() {
-            Log.i(TAG, "Privileged service reported onGreetingFinished (ignored: in-process greeting master controls playback duration).")
+            Log.i(TAG, "Privileged VoicemailUserService reported onGreetingFinished.")
+            mainHandler.post {
+                onGreetingPlaybackFinished()
+            }
         }
 
         override fun onError(message: String?) {
-            Log.e(TAG, "Privileged audio service reported error: $message")
-            // Safety net: in-process audio recording
-            startInProcessAudioRecord()
+            Log.e(TAG, "Privileged VoicemailUserService reported error: $message. Falling back to in-process downlink capture.")
+            mainHandler.post {
+                onGreetingPlaybackFinished()
+                startInProcessDownlinkFallback()
+            }
         }
     }
 
@@ -163,6 +180,8 @@ class VoicemailInCallService : InCallService() {
         shizukuAudioController = VoicemailApplication.shizukuController
         transcriber = VoicemailApplication.transcriber
         TelecomCallManager.currentInCallService = this
+        // Pre-bind Shizuku UserService so it is hot when a call arrives
+        shizukuAudioController.bindUserService()
         Log.i(TAG, "VoicemailInCallService created with shared singletons.")
     }
 
@@ -223,18 +242,15 @@ class VoicemailInCallService : InCallService() {
 
         updateInCallNotification()
 
-        // Immediate launch of InCallActivity for Lockscreen & Heads-up presentation on Vivo FuntouchOS
         try {
             val activityIntent = Intent(this, InCallActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             }
             startActivity(activityIntent)
-            Log.i(TAG, "Launched InCallActivity directly from onCallAdded")
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed launching InCallActivity directly from onCallAdded", t)
+            Log.e(TAG, "Failed launching InCallActivity from onCallAdded", t)
         }
 
-        // If call is incoming ringing, schedule 8-second auto-screening countdown
         if (call.state == Call.STATE_RINGING && !isOutgoing) {
             startAutoAnswerTimer()
         }
@@ -242,7 +258,6 @@ class VoicemailInCallService : InCallService() {
 
     override fun onCallRemoved(call: Call) {
         super.onCallRemoved(call)
-        Log.i(TAG, "onCallRemoved.")
         call.unregisterCallback(callCallback)
         allCalls.remove(call)
         TelecomCallManager.updateCallsList(allCalls)
@@ -253,6 +268,11 @@ class VoicemailInCallService : InCallService() {
 
     override fun onCallAudioStateChanged(audioState: CallAudioState?) {
         super.onCallAudioStateChanged(audioState)
+        // If voicemail screening is active, enforce hardware mute so the caller NEVER hears the user
+        if (isVoicemailScreeningActive && audioState != null && !audioState.isMuted) {
+            setMuted(true)
+            audioManager.isMicrophoneMute = true
+        }
         TelecomCallManager.updateAudioState(audioState)
     }
 
@@ -271,7 +291,6 @@ class VoicemailInCallService : InCallService() {
             val uri = Uri.fromParts("tel", number, null)
             val tm = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
             tm?.placeCall(uri, null)
-            Log.i(TAG, "Placed second call to $number for multi-call conference.")
         } catch (t: Throwable) {
             Log.e(TAG, "Error placing second call: ${t.message}")
         }
@@ -296,7 +315,8 @@ class VoicemailInCallService : InCallService() {
     }
 
     /**
-     * Answers call and initiates Live Voicemail screening with deterministic polling.
+     * Answers the call silently, mutes the user's microphone and room speaker immediately,
+     * and launches the privileged Shizuku voicemail greeting + downlink capture pipeline.
      */
     fun triggerLiveVoicemailScreening(call: Call? = activeCall) {
         val targetCall = call ?: return
@@ -308,15 +328,19 @@ class VoicemailInCallService : InCallService() {
         }
 
         serviceScope.launch(Dispatchers.Main) {
-            Log.i(TAG, "Triggering Live Voicemail: Requesting answer and setting screening active.")
+            Log.i(TAG, "Triggering Live Voicemail: Muting room audio & mic BEFORE answering.")
+            isVoicemailScreeningActive = true
             TelecomCallManager.setScreeningState(TelecomCallManager.CallScreeningState.SCREENING_ANSWERING)
+            TelecomCallManager.setScreeningSpeakerStateOnly(false)
             updateInCallNotification()
+
+            // Pre-mute call stream & microphone before answering so there is zero audio pop/bleed
+            enforceSilentScreeningAudioState()
 
             if (targetCall.state == Call.STATE_RINGING || targetCall.state == Call.STATE_CONNECTING) {
                 targetCall.answer(VideoProfile.STATE_AUDIO_ONLY)
             }
 
-            // Actively poll until call reaches STATE_ACTIVE (max 5 seconds) instead of relying solely on callback
             var waitedMs = 0
             while (targetCall.state != Call.STATE_ACTIVE && targetCall.state != Call.STATE_DISCONNECTED && waitedMs < 5000) {
                 delay(100)
@@ -329,55 +353,41 @@ class VoicemailInCallService : InCallService() {
                 return@launch
             }
 
-            // Wait 600ms for Vivo VoLTE modem to stabilize audio path
-            delay(600)
-            executeVoicemailPipeline(targetCall)
+            // Re-enforce silent screening state as soon as Telecom activates the call audio path
+            enforceSilentScreeningAudioState()
+
+            // Wait 500ms for VoLTE modem path setup
+            delay(500)
+            enforceSilentScreeningAudioState()
+            executeVoicemailPipeline()
         }
     }
 
     /**
-     * Executes the authoritative greeting playback and caller transcription session.
+     * Forces Earpiece route, mutes STREAM_VOICE_CALL (silent in room), and mutes the phone's
+     * physical microphone so the caller cannot hear the user during voicemail screening.
      */
-    private fun executeVoicemailPipeline(call: Call) {
+    private fun enforceSilentScreeningAudioState() {
+        try {
+            setAudioRoute(CallAudioState.ROUTE_EARPIECE)
+            setMuted(true)
+            audioManager.isSpeakerphoneOn = false
+            audioManager.isMicrophoneMute = true
+            audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed enforcing silent screening audio state: ${t.message}")
+        }
+    }
+
+    private suspend fun executeVoicemailPipeline() {
         isVoicemailScreeningActive = true
         isGreetingFinished.set(false)
+        chunksReceivedCount.set(0)
 
         TelecomCallManager.setScreeningState(TelecomCallManager.CallScreeningState.SCREENING_GREETING)
         updateInCallNotification()
 
-        // 1. Switch call audio route to ROUTE_SPEAKER so bottom speaker is loud and active
-        try {
-            setAudioRoute(CallAudioState.ROUTE_SPEAKER)
-            Log.i(TAG, "Audio route set to ROUTE_SPEAKER for greeting acoustic playback.")
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed setting ROUTE_SPEAKER: ${t.message}")
-        }
-
-        // 2. Unmute microphone and maximize volume during greeting
-        try {
-            audioManager.isMicrophoneMute = false
-            audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-            audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxVol, 0)
-            val maxMusicVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maxMusicVol, 0)
-            Log.i(TAG, "Microphone unmuted and streams set to MAX volume for greeting transmission.")
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed setting greeting volume: ${t.message}")
-        }
-
-        // 3. Ensure InCallActivity is visible in foreground
-        try {
-            val activityIntent = Intent(this, InCallActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            }
-            startActivity(activityIntent)
-        } catch (t: Throwable) {
-            Log.e(TAG, "Failed ensuring InCallActivity visibility in executeVoicemailPipeline", t)
-        }
-
-        // 4. Start transcriber session
+        // Start transcriber session now so it is ready the instant the greeting finishes
         val number = TelecomCallManager.phoneNumber.value
         val name = TelecomCallManager.callerName.value
         val simName = TelecomCallManager.simDisplayName.value
@@ -390,67 +400,89 @@ class VoicemailInCallService : InCallService() {
             simSlotIndex = simSlot
         )
 
-        // 5. In-process authoritative greeting playback (plays full ~5.6s file with beep)
-        playAuthoritativeGreeting()
+        val shizukuReady = withContext(Dispatchers.IO) {
+            shizukuAudioController.updateShizukuStatus() && shizukuAudioController.ensureBound(2500L)
+        }
 
-        // 6. Connect to Shizuku privileged audio service for Qualcomm hardware DSP assistance
-        val greetingFd = GreetingGenerator.getGreetingAssetFileDescriptor(this)
-        serviceScope.launch(Dispatchers.IO) {
-            val isBound = shizukuAudioController.ensureBound(3000L)
-            Log.i(TAG, "Shizuku UserService connection verified: $isBound")
-            if (isBound) {
-                shizukuAudioController.startVoicemailSession(greetingFd, audioChunkCallback)
-            } else {
-                Log.w(TAG, "Shizuku not bound. Starting immediate in-process AudioRecord safety net.")
-                withContext(Dispatchers.Main) {
-                    startInProcessAudioRecord()
+        if (shizukuReady) {
+            Log.i(TAG, "Shizuku VoicemailUserService is bound! Dispatching privileged uplink greeting + downlink capture.")
+            try {
+                val afd = GreetingGenerator.getGreetingAssetFileDescriptor(this)
+                shizukuAudioController.startVoicemailSession(afd, audioChunkCallback)
+
+                // Safety timeout in case binder callback is delayed
+                greetingTimeoutJob?.cancel()
+                greetingTimeoutJob = serviceScope.launch {
+                    delay(8000L)
+                    if (!isGreetingFinished.get() && isVoicemailScreeningActive) {
+                        Log.w(TAG, "Privileged greeting timeout (8s) reached; ensuring SCREENING_LIVE_VOICEMAIL state.")
+                        onGreetingPlaybackFinished()
+                    }
                 }
+                return
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed starting Shizuku voicemail session, falling back", t)
             }
         }
+
+        Log.w(TAG, "Shizuku unavailable or unbound! Using silent in-process telephony fallback.")
+        playFallbackGreetingToTelephony()
     }
 
-    private fun playAuthoritativeGreeting() {
+    /**
+     * Fallback used ONLY when Shizuku is not running: routes greeting to TYPE_TELEPHONY / Earpiece
+     * (never loudspeaker!) so it does not blast loudly in the room.
+     */
+    private fun playFallbackGreetingToTelephony() {
         try {
+            enforceSilentScreeningAudioState()
+            audioManager.setParameters("incall_music_enabled=true;incall_music_uplink=true;music_playback_during_call=true")
+
             val greetingFile = GreetingGenerator.getActiveGreetingFile(this)
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+
             val mp = MediaPlayer().apply {
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
+                setAudioAttributes(attrs)
                 setDataSource(greetingFile.absolutePath)
+                val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                val telephonyDevice = outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+                    ?: outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+                if (telephonyDevice != null) {
+                    setPreferredDevice(telephonyDevice)
+                }
                 setVolume(1.0f, 1.0f)
                 prepare()
-                start()
             }
             inProcessGreetingPlayer = mp
             val dur = mp.duration
-            Log.i(TAG, "Authoritative Greeting MediaPlayer started on ROUTE_SPEAKER (${greetingFile.length()} bytes, duration=${dur}ms)")
 
             mp.setOnCompletionListener {
-                Log.i(TAG, "Greeting MediaPlayer completed naturally. Initiating caller voice capture.")
                 onGreetingPlaybackFinished()
+                startInProcessDownlinkFallback()
             }
-            mp.setOnErrorListener { _, what, extra ->
-                Log.e(TAG, "Greeting MediaPlayer error what=$what extra=$extra")
+            mp.setOnErrorListener { _, _, _ ->
                 onGreetingPlaybackFinished()
+                startInProcessDownlinkFallback()
                 true
             }
 
-            // Safety timeout safeguard in case onCompletionListener fails to trigger (dur + 1000ms or 6500ms)
             val timeoutMs = if (dur > 0) (dur + 1000L) else 6500L
             greetingTimeoutJob?.cancel()
             greetingTimeoutJob = serviceScope.launch {
                 delay(timeoutMs)
                 if (!isGreetingFinished.get() && isVoicemailScreeningActive) {
-                    Log.i(TAG, "Greeting safety timeout fired ($timeoutMs ms). Transitioning to caller capture.")
                     onGreetingPlaybackFinished()
+                    startInProcessDownlinkFallback()
                 }
             }
+            mp.start()
         } catch (t: Throwable) {
-            Log.e(TAG, "Authoritative greeting playback failed: ${t.message}", t)
+            Log.e(TAG, "Fallback greeting failed: ${t.message}", t)
             onGreetingPlaybackFinished()
+            startInProcessDownlinkFallback()
         }
     }
 
@@ -462,22 +494,94 @@ class VoicemailInCallService : InCallService() {
 
         if (!isVoicemailScreeningActive) return
 
-        Log.i(TAG, "Greeting fully finished. Transitioning to SCREENING_LIVE_VOICEMAIL.")
+        Log.i(TAG, "Greeting finished. Transitioning UI to SCREENING_LIVE_VOICEMAIL (mic muted, speaker off by default).")
 
-        // Silence room audio: switch to earpiece and mute STREAM_VOICE_CALL
         try {
-            setAudioRoute(CallAudioState.ROUTE_EARPIECE)
-            audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0)
+            audioManager.setParameters("incall_music_enabled=false;incall_music_uplink=false")
+            // Keep physical microphone strictly muted so caller cannot hear user!
+            setMuted(true)
+            audioManager.isMicrophoneMute = true
+
+            // Respect user's "Listen Live" toggle (default is FALSE = completely silent in room)
+            val listenLive = TelecomCallManager.isScreeningSpeakerOn.value
+            setScreeningSpeakerEnabled(listenLive)
         } catch (t: Throwable) {
-            Log.w(TAG, "Error silencing audio after greeting: ${t.message}")
+            Log.w(TAG, "Error configuring post-greeting audio state: ${t.message}")
         }
 
         TelecomCallManager.setScreeningState(TelecomCallManager.CallScreeningState.SCREENING_LIVE_VOICEMAIL)
         updateInCallNotification()
+    }
 
-        // Start caller voice recording & live transcription
-        startInProcessAudioRecord()
-        startChunkWatchdog()
+    /**
+     * Fallback downlink recorder used ONLY if Shizuku UID 2000 capture fails.
+     * Attempts VOICE_DOWNLINK (3) and VOICE_CALL (4) with TYPE_TELEPHONY input while keeping the mic muted.
+     */
+    private fun startInProcessDownlinkFallback() {
+        if (inProcessRecordJob != null || !isVoicemailScreeningActive) return
+        inProcessRecordJob = serviceScope.launch(Dispatchers.IO) {
+            val candidateSources = intArrayOf(
+                3, // MediaRecorder.AudioSource.VOICE_DOWNLINK
+                MediaRecorder.AudioSource.VOICE_CALL,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            )
+            val inputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            val telephonyInput = inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+
+            var record: AudioRecord? = null
+            val minBuf = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val bufferSize = max(minBuf, 3200 * 4)
+
+            for (src in candidateSources) {
+                try {
+                    val candidate = AudioRecord(src, 16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
+                    if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+                        if (telephonyInput != null) {
+                            runCatching { candidate.setPreferredDevice(telephonyInput) }
+                        }
+                        candidate.startRecording()
+                        if (candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                            record = candidate
+                            Log.i(TAG, "Fallback AudioRecord started with source=$src")
+                            break
+                        }
+                    }
+                    candidate.release()
+                } catch (ignored: Throwable) {}
+            }
+
+            if (record == null) {
+                Log.e(TAG, "Fallback AudioRecord could not open downlink source (Shizuku permission required).")
+                return@launch
+            }
+
+            inProcessAudioRecord = record
+            val buf = ShortArray(1600)
+            try {
+                while (isVoicemailScreeningActive) {
+                    // Keep physical microphone muted so local voice is never recorded!
+                    if (!audioManager.isMicrophoneMute) {
+                        audioManager.isMicrophoneMute = true
+                    }
+                    val read = record.read(buf, 0, buf.size)
+                    if (read > 0 && isGreetingFinished.get()) {
+                        val copy = ShortArray(read)
+                        for (i in 0 until read) {
+                            copy[i] = (buf[i].toInt() * 2).coerceIn(-32768, 32767).toShort()
+                        }
+                        transcriber.submitPcmChunk(copy)
+                    } else if (read < 0) {
+                        break
+                    }
+                }
+            } finally {
+                runCatching {
+                    record.stop()
+                    record.release()
+                }
+                if (inProcessAudioRecord == record) inProcessAudioRecord = null
+            }
+        }
     }
 
     private fun stopInProcessGreetingFallback() {
@@ -486,72 +590,6 @@ class VoicemailInCallService : InCallService() {
             inProcessGreetingPlayer?.release()
         } catch (ignored: Throwable) {}
         inProcessGreetingPlayer = null
-    }
-
-    private fun startChunkWatchdog() {
-        chunksReceivedCount.set(0)
-        serviceScope.launch {
-            delay(2500L)
-            if (isVoicemailScreeningActive && chunksReceivedCount.get() == 0) {
-                Log.w(TAG, "No PCM chunks received from Shizuku after 2.5s. Engaging in-process AudioRecord safety net...")
-                startInProcessAudioRecord()
-            }
-        }
-    }
-
-    private fun startInProcessAudioRecord() {
-        if (inProcessRecordJob != null || !isVoicemailScreeningActive) return
-        inProcessRecordJob = serviceScope.launch(Dispatchers.IO) {
-            val minBuf = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val record = try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                    16000,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    max(minBuf, 3200 * 4)
-                )
-            } catch (t: Throwable) {
-                null
-            } ?: try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    16000,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    max(minBuf, 3200 * 4)
-                )
-            } catch (t: Throwable) {
-                null
-            }
-
-            if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "Failed initializing in-process fallback AudioRecord")
-                return@launch
-            }
-
-            inProcessAudioRecord = record
-            try {
-                record.startRecording()
-                Log.i(TAG, "In-process fallback AudioRecord started successfully")
-                val buf = ShortArray(1600)
-                while (isVoicemailScreeningActive && record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    val read = record.read(buf, 0, buf.size)
-                    if (read > 0) {
-                        chunksReceivedCount.incrementAndGet()
-                        transcriber.submitPcmChunk(buf.copyOf(read))
-                    }
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "In-process AudioRecord loop error", t)
-            } finally {
-                try {
-                    record.stop()
-                    record.release()
-                } catch (ignored: Throwable) {}
-                if (inProcessAudioRecord == record) inProcessAudioRecord = null
-            }
-        }
     }
 
     private fun stopInProcessAudioRecord() {
@@ -565,41 +603,64 @@ class VoicemailInCallService : InCallService() {
     }
 
     /**
-     * Handles user tapping "Pick Up" to talk to the caller directly.
+     * Handles user tapping "Pick Up" to take over the call and talk to the caller live.
      */
     fun takeOverVoicemailCall() {
-        Log.i(TAG, "Taking over Live Voicemail session: transitioning to active conversation.")
+        Log.i(TAG, "Taking over Live Voicemail session: stopping screening and unmuting user microphone.")
+        isVoicemailScreeningActive = false
         stopInProcessGreetingFallback()
         stopInProcessAudioRecord()
-
-        // 1. Stop privileged screening audio session
         shizukuAudioController.stopVoicemailSession()
 
-        // 2. Unmute hardware microphone & voice call stream
+        // 1. Unmute hardware microphone & restore normal earpiece/call volume for live conversation
+        setMuted(false)
         audioManager.isMicrophoneMute = false
+        audioManager.isSpeakerphoneOn = false
+        setAudioRoute(CallAudioState.ROUTE_EARPIECE)
         audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVol * 0.8f).toInt().coerceAtLeast(3), 0)
 
-        // 3. Acquire proximity lock so ear proximity blanks display
+        // 2. Acquire proximity lock so ear proximity blanks display
         acquireProximityWakeLock()
 
-        // 4. Update UI state to ActiveCall
+        // 3. Update UI state to ActiveCall
         TelecomCallManager.setScreeningState(TelecomCallManager.CallScreeningState.ACTIVE_CALL)
         updateInCallNotification()
 
-        // 5. Finalize voicemail record as picked up
+        // 4. Finalize voicemail record as picked up
         stopAndSaveVoicemailSession(isPickedUp = true)
     }
 
+    /**
+     * Toggles whether the user wants to hear the caller's voice out loud in the room while screening.
+     * Microphone remains strictly muted either way.
+     */
     fun setScreeningSpeakerEnabled(enabled: Boolean) {
-        shizukuAudioController.setScreeningSpeakerEnabled(enabled)
+        try {
+            setMuted(true)
+            audioManager.isMicrophoneMute = true
+            shizukuAudioController.setScreeningSpeakerEnabled(enabled)
+
+            if (enabled) {
+                setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+                audioManager.isSpeakerphoneOn = true
+                audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVol * 0.7f).toInt().coerceAtLeast(2), 0)
+            } else {
+                setAudioRoute(CallAudioState.ROUTE_EARPIECE)
+                audioManager.isSpeakerphoneOn = false
+                audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0)
+            }
+            Log.i(TAG, "setScreeningSpeakerEnabled($enabled): micMuted=true, speaker=$enabled")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error toggling screening speaker: ${t.message}")
+        }
     }
 
-    /**
-     * Guarantees that every screened call is saved to repository exactly once.
-     */
     fun stopAndSaveVoicemailSession(isPickedUp: Boolean = false, onComplete: (() -> Unit)? = null) {
         if (hasSavedCurrentSession.getAndSet(true)) {
-            Log.d(TAG, "Session already saved for current call.")
             onComplete?.invoke()
             return
         }
@@ -608,13 +669,17 @@ class VoicemailInCallService : InCallService() {
         releaseProximityWakeLock()
         stopInProcessGreetingFallback()
         stopInProcessAudioRecord()
+        shizukuAudioController.stopVoicemailSession()
 
         val wasScreening = isVoicemailScreeningActive || isScreeningSessionRunning.get()
+        val wasGreetingPlaying = !isGreetingFinished.get()
         isVoicemailScreeningActive = false
         isScreeningSessionRunning.set(false)
 
-        shizukuAudioController.stopVoicemailSession()
+        // Restore normal audio state when session ends
+        setMuted(false)
         audioManager.isMicrophoneMute = false
+        audioManager.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
 
         TelecomCallManager.setScreeningState(
             if (isPickedUp) TelecomCallManager.CallScreeningState.ACTIVE_CALL
@@ -622,12 +687,51 @@ class VoicemailInCallService : InCallService() {
         )
 
         appScope.launch(NonCancellable) {
-            Log.i(TAG, "NonCancellable job saving voicemail on session completion...")
             try {
-                val voicemail = transcriber.stopSession(isPickedUp = isPickedUp, saveToRepository = true)
-                if (voicemail != null) {
-                    Log.i(TAG, "SAVED VOICEMAIL ENTRY: id=${voicemail.id}, number=${voicemail.phoneNumber}, duration=${voicemail.durationSeconds}")
-                    if (wasScreening && !isPickedUp && voicemail.transcript.isNotBlank()) {
+                if (wasGreetingPlaying && wasScreening && !isPickedUp) {
+                    val number = TelecomCallManager.phoneNumber.value
+                    val name = TelecomCallManager.callerName.value
+                    val simName = TelecomCallManager.simDisplayName.value
+                    val simSlot = TelecomCallManager.simSlotIndex.value
+
+                    transcriber.stopSession(isPickedUp = false, saveToRepository = false)
+
+                    val recordingsDir = java.io.File(filesDir, "recordings").apply { mkdirs() }
+                    val cleanNumber = number.replace(Regex("[^0-9+]"), "").ifEmpty { "unknown" }
+                    val timeStamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+                    val finalWavFile = java.io.File(recordingsDir, "voicemail_${cleanNumber}_$timeStamp.wav")
+                    try {
+                        val silenceBytes = ByteArray(16000 * 2)
+                        java.io.FileOutputStream(finalWavFile).use { fos ->
+                            GreetingGenerator.writeWavHeader(
+                                out = fos,
+                                totalAudioLen = silenceBytes.size.toLong(),
+                                sampleRate = 16000,
+                                channels = 1,
+                                bitsPerSample = 16
+                            )
+                            fos.write(silenceBytes)
+                            fos.flush()
+                        }
+                    } catch (ignored: Throwable) {}
+
+                    val entity = com.personal.voicemail.data.VoicemailEntity(
+                        callerName = name,
+                        phoneNumber = number,
+                        simSlotIndex = simSlot,
+                        simDisplayName = simName,
+                        timestamp = System.currentTimeMillis(),
+                        durationSeconds = 1,
+                        transcript = "Caller hung up during greeting",
+                        audioFilePath = finalWavFile.absolutePath,
+                        isRead = false,
+                        isPickedUp = false
+                    )
+                    VoicemailApplication.voicemailRepository.addVoicemail(entity)
+                    postVoicemailCompletedNotification(name ?: number, "Caller hung up during greeting")
+                } else if (wasScreening) {
+                    val voicemail = transcriber.stopSession(isPickedUp = isPickedUp, saveToRepository = true)
+                    if (voicemail != null && !isPickedUp && voicemail.transcript.isNotBlank()) {
                         postVoicemailCompletedNotification(voicemail.callerName ?: voicemail.phoneNumber, voicemail.transcript)
                     }
                 }
@@ -645,7 +749,6 @@ class VoicemailInCallService : InCallService() {
         cancelAutoAnswerTimer()
         releaseProximityWakeLock()
         stopAndSaveVoicemailSession(isPickedUp = false) {
-            // Dismiss in-call notification ONLY AFTER session has been written to disk and saved to Room
             try {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 val nm = getSystemService(NotificationManager::class.java)
@@ -655,7 +758,6 @@ class VoicemailInCallService : InCallService() {
             }
         }
 
-        // Reset state after brief delay
         mainHandler.postDelayed({
             TelecomCallManager.reset()
             activeCall = null
@@ -664,7 +766,6 @@ class VoicemailInCallService : InCallService() {
 
     private fun updateInCallNotification() {
         val name = TelecomCallManager.callerName.value ?: TelecomCallManager.phoneNumber.value.ifBlank { "Phone Call" }
-        val number = TelecomCallManager.phoneNumber.value
         val simLabel = TelecomCallManager.simDisplayName.value
         val state = TelecomCallManager.screeningState.value
 
@@ -674,9 +775,9 @@ class VoicemailInCallService : InCallService() {
             TelecomCallManager.CallScreeningState.OUTGOING_DIALING ->
                 Pair(name, "$simLabel • Calling…")
             TelecomCallManager.CallScreeningState.SCREENING_ANSWERING ->
-                Pair(name, "$simLabel • Answering for Voicemail…")
+                Pair(name, "$simLabel • Answering Silently…")
             TelecomCallManager.CallScreeningState.SCREENING_GREETING ->
-                Pair(name, "$simLabel • Playing Greeting…")
+                Pair(name, "$simLabel • Playing Greeting to Caller…")
             TelecomCallManager.CallScreeningState.SCREENING_LIVE_VOICEMAIL ->
                 Pair(name, "$simLabel • Live Voicemail Screening")
             TelecomCallManager.CallScreeningState.ACTIVE_CALL ->
@@ -757,11 +858,7 @@ class VoicemailInCallService : InCallService() {
             )
             builder.addAction(android.R.drawable.sym_call_incoming, getString(R.string.button_pickup), pendingPickUp)
             builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.button_end_call), pendingHangUp)
-        } else if (state == TelecomCallManager.CallScreeningState.OUTGOING_DIALING) {
-            // Outgoing call dialing: Only End Call
-            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.button_end_call), pendingHangUp)
         } else if (state == TelecomCallManager.CallScreeningState.ACTIVE_CALL) {
-            // Normal active call: Screen Call and End Call
             val voicemailIntent = Intent(this, VoicemailInCallService::class.java).apply {
                 action = ACTION_TRIGGER_VOICEMAIL
             }
@@ -818,7 +915,6 @@ class VoicemailInCallService : InCallService() {
             }
             if (proximityWakeLock?.isHeld == false) {
                 proximityWakeLock?.acquire(2 * 60 * 60 * 1000L)
-                Log.i(TAG, "Proximity wake lock acquired.")
             }
         }
     }
@@ -826,15 +922,8 @@ class VoicemailInCallService : InCallService() {
     private fun releaseProximityWakeLock() {
         if (proximityWakeLock?.isHeld == true) {
             proximityWakeLock?.release()
-            Log.i(TAG, "Proximity wake lock released.")
         }
         proximityWakeLock = null
-    }
-
-    private fun parsePhoneNumber(uri: Uri?): String {
-        if (uri == null) return "Unknown"
-        val schemeSpecific = uri.schemeSpecificPart
-        return schemeSpecific ?: uri.toString()
     }
 
     private fun resolveContactName(phoneNumber: String): String {
@@ -855,7 +944,6 @@ class VoicemailInCallService : InCallService() {
             }
             phoneNumber
         } catch (e: Exception) {
-            Log.w(TAG, "Error looking up contact name for $phoneNumber: ${e.message}")
             phoneNumber
         }
     }

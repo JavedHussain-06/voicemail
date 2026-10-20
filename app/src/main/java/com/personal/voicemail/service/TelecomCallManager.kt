@@ -103,12 +103,25 @@ object TelecomCallManager {
     }
 
     fun setScreeningState(state: CallScreeningState) {
+        val previousState = _screeningState.value
         _screeningState.value = state
+        // Default to SILENT screening when entering greeting or live voicemail from ringing/answering
+        if ((state == CallScreeningState.SCREENING_ANSWERING ||
+                    state == CallScreeningState.SCREENING_GREETING) &&
+            previousState != CallScreeningState.SCREENING_GREETING &&
+            previousState != CallScreeningState.SCREENING_LIVE_VOICEMAIL
+        ) {
+            _isScreeningSpeakerOn.value = false
+        }
         if (state == CallScreeningState.ACTIVE_CALL) {
             startDurationTimer()
         } else if (state == CallScreeningState.IDLE || state == CallScreeningState.DISCONNECTED) {
             stopDurationTimer()
         }
+    }
+
+    fun setScreeningSpeakerStateOnly(enabled: Boolean) {
+        _isScreeningSpeakerOn.value = enabled
     }
 
     fun setIsOnHold(onHold: Boolean) {

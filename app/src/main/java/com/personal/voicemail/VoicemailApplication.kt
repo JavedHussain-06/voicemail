@@ -40,6 +40,9 @@ class VoicemailApplication : Application() {
         voicemailRepository = com.personal.voicemail.data.VoicemailRepository.getInstance(this)
         transcriber = com.personal.voicemail.recognition.LiveVoicemailTranscriber.getInstance(this)
 
+        shizukuController.requestShizukuPermission()
+        shizukuController.bindUserService()
+
         // 3. Initialize High-Priority Notification Channels for InCallService and Voicemail Alerts
         createNotificationChannels()
 
