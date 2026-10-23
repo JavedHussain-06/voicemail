@@ -2,8 +2,8 @@ package com.personal.voicemail.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// iOS 17 Dark Glassmorphism Palette
-val DarkBackground = Color(0xFF0A0A0C)
+// iOS Dark OLED Palette
+val DarkBackground = Color(0xFF000000)
 val DarkSurface = Color(0xFF141418)
 val DarkSurfaceElevated = Color(0xFF1C1C22)
 

@@ -9,7 +9,7 @@
     <string name="active_call">Active Call</string>
     <string name="call_ended">Call Ended</string>
     <string name="button_voicemail">Voicemail</string>
-    <string name="button_screen_call">Screen Call</string>
+    <string name="button_screen_call">Voicemail</string>
     <string name="button_pickup">Pick Up</string>
     <string name="button_answer">Answer</string>
     <string name="button_end_call">End Call</string>

@@ -163,7 +163,17 @@ object TelecomCallManager {
 
     fun endCall() {
         Log.i(TAG, "User requested end call.")
-        currentCall?.disconnect()
+        val call = currentCall ?: return
+        try {
+            if (call.state == Call.STATE_RINGING) {
+                call.reject(false, null)
+            } else {
+                call.disconnect()
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error ending/rejecting call: ${t.message}", t)
+            runCatching { call.disconnect() }
+        }
     }
 
     fun toggleMute() {

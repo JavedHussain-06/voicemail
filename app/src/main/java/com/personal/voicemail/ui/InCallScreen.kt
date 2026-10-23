@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PhoneForwarded
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SwapCalls
+import androidx.compose.material.icons.filled.Voicemail
 import androidx.compose.material.icons.filled.VolumeDown
 import androidx.compose.material.icons.filled.VolumeMute
 import androidx.compose.material.icons.filled.VolumeUp
@@ -51,7 +52,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -103,9 +107,10 @@ fun InCallScreen(
     var showKeypadOverlay by remember { mutableStateOf(false) }
     var showAddCallOverlay by remember { mutableStateOf(false) }
 
-    // If call disconnected, auto-dismiss
+    // If call disconnected, show "Call Ended" briefly before auto-dismiss
     LaunchedEffect(screeningState) {
         if (screeningState == CallScreeningState.DISCONNECTED) {
+            delay(1200L)
             onDismiss()
         }
     }
@@ -551,7 +556,7 @@ private fun ScreeningTranscriptCard(
 
             // Footer note
             Text(
-                text = "Screening silently with offline Sherpa-ONNX. Tap Pick Up to answer.",
+                text = "Live Voicemail recording caller. Tap Pick Up to answer.",
                 fontSize = 11.sp,
                 color = TextSecondary,
                 textAlign = TextAlign.Center,
@@ -628,7 +633,7 @@ private fun IncomingCallRingingCard(rmsLevel: Float) {
         }
         Spacer(modifier = Modifier.height(20.dp))
         Text(
-            text = "Auto-screening begins in 8 seconds…",
+            text = "Live Voicemail starts in 8s…",
             fontSize = 14.sp,
             color = TextSecondary
         )
@@ -658,10 +663,10 @@ private fun IncomingCallControls(
             onClick = onDecline
         )
 
-        // Voicemail (Screen Call) - Purple/Blue button
+        // Voicemail - Purple/Blue button
         GlassmorphicCircleButton(
-            icon = Icons.Default.PhoneForwarded,
-            label = "Screen Call",
+            icon = Icons.Default.Voicemail,
+            label = "Voicemail",
             size = 68.dp,
             containerColor = Color(0xFF5E5CE6),
             iconTint = Color.White,
@@ -824,8 +829,8 @@ private fun ActiveCallControls(
             )
 
             GlassmorphicCircleButton(
-                icon = Icons.Default.PhoneForwarded,
-                label = "Screen Call",
+                icon = Icons.Default.Voicemail,
+                label = "Voicemail",
                 containerColor = Color(0xFF5E5CE6),
                 iconTint = Color.White,
                 onClick = onSendToVoicemail
@@ -1076,6 +1081,7 @@ private fun DtmfKeyButton(
     onPress: () -> Unit,
     onRelease: () -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     Box(
         modifier = Modifier
             .size(76.dp)
@@ -1083,8 +1089,11 @@ private fun DtmfKeyButton(
             .background(GlassSurface)
             .border(1.dp, GlassBorder, CircleShape)
             .clickable {
-                onPress()
-                onRelease()
+                scope.launch {
+                    onPress()
+                    delay(150L)
+                    onRelease()
+                }
             },
         contentAlignment = Alignment.Center
     ) {

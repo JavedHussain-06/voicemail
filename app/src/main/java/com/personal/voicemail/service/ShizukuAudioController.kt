@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.AssetFileDescriptor
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -22,23 +23,20 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 import rikka.shizuku.Shizuku
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Manages the IPC connection lifecycle between the application and the privileged
- * VoicemailUserService running under UID 2000 (com.android.shell) via Shizuku or internal root daemon.
- *
- * Implements Built-in Daemon Auto-Bootstrap (no external Shizuku app required if root or local
- * shell daemon is available) and non-blocking background connection resilience.
- */
 class ShizukuAudioController private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "ShizukuAudioController"
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val BASE_RECONNECT_DELAY_MS = 1000L
+
+        const val ADB_ONE_TIME_GRANT_COMMAND =
+            "appops set com.personal.voicemail RECORD_AUDIO allow ; appops set com.personal.voicemail PLAY_AUDIO allow ; appops set com.personal.voicemail PROJECT_MEDIA allow ; appops set com.personal.voicemail CAPTURE_AUDIO_OUTPUT allow ; appops set com.personal.voicemail MODIFY_AUDIO_ROUTING allow ; cmd appops set com.android.shell RECORD_AUDIO allow ; cmd appops set com.android.shell CAPTURE_AUDIO_OUTPUT allow ; cmd appops set com.android.shell MODIFY_AUDIO_ROUTING allow"
 
         @Volatile
         private var INSTANCE: ShizukuAudioController? = null
@@ -66,20 +64,17 @@ class ShizukuAudioController private constructor(private val context: Context) {
     val isBound: Boolean
         get() = _isServiceBound.value && userService != null
 
-    /**
-     * Exposes whether an enhanced privileged telephony daemon is active (via Shizuku UID 2000
-     * or root-granted CAPTURE_AUDIO_OUTPUT). Standalone mode never requires this to be true.
-     */
-    val isPrivilegedDaemonActive: Boolean
-        get() = isBound || (context.checkSelfPermission("android.permission.CAPTURE_AUDIO_OUTPUT") == PackageManager.PERMISSION_GRANTED)
+    fun hasPermanentDigitalTelephonyPrivilege(): Boolean {
+        val hasCapture = context.checkSelfPermission("android.permission.CAPTURE_AUDIO_OUTPUT") == PackageManager.PERMISSION_GRANTED
+        val hasRouting = context.checkSelfPermission("android.permission.MODIFY_AUDIO_ROUTING") == PackageManager.PERMISSION_GRANTED
+        return isBound || (hasCapture && hasRouting)
+    }
 
-    /**
-     * Ensures the privileged Shizuku UserService is bound before executing audio commands.
-     * Suspends until the service is connected or timeout expires.
-     */
-    suspend fun ensureBound(timeoutMs: Long = 3000L): Boolean {
+    val isPrivilegedDaemonActive: Boolean
+        get() = isBound || hasPermanentDigitalTelephonyPrivilege()
+
+    suspend fun ensureBound(timeoutMs: Long = 2500L): Boolean {
         if (isBound) return true
-        Log.i(TAG, "ensureBound: UserService not yet bound. Initiating bind with timeout ${timeoutMs}ms...")
         bindUserService()
         val connected = withTimeoutOrNull(timeoutMs) {
             _isServiceBound.first { it && userService != null }
@@ -94,12 +89,15 @@ class ShizukuAudioController private constructor(private val context: Context) {
     private val pendingConnectCallbacks = mutableListOf<(IVoicemailAudioService?) -> Unit>()
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
-        Log.i(TAG, "Shizuku binder received from ShizukuProvider")
+        Log.i(TAG, "Shizuku binder received")
         updateShizukuStatus()
+        grantPermanentStandalonePermissions {
+            bindUserService()
+        }
     }
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
-        Log.w(TAG, "Shizuku binder died. Shizuku manager service may have been terminated.")
+        Log.w(TAG, "Shizuku binder died.")
         _isShizukuInstalledAndRunning.value = false
         _isPermissionGranted.value = false
         _isServiceBound.value = false
@@ -107,18 +105,19 @@ class ShizukuAudioController private constructor(private val context: Context) {
     }
 
     private val requestPermissionResultListener =
-        Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        Shizuku.OnRequestPermissionResultListener { _, grantResult ->
             val granted = grantResult == PackageManager.PERMISSION_GRANTED
-            Log.i(TAG, "Shizuku permission request result ($requestCode): granted=$granted")
             _isPermissionGranted.value = granted
             if (granted) {
-                bindUserService()
+                grantPermanentStandalonePermissions {
+                    bindUserService()
+                }
             }
         }
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            Log.i(TAG, "Privileged VoicemailUserService connected via Shizuku binder.")
+            Log.i(TAG, "Privileged VoicemailUserService (UID 2000) connected!")
             if (binder != null && binder.pingBinder()) {
                 val service = IVoicemailAudioService.Stub.asInterface(binder)
                 userService = service
@@ -131,7 +130,6 @@ class ShizukuAudioController private constructor(private val context: Context) {
                     pendingConnectCallbacks.clear()
                 }
             } else {
-                Log.e(TAG, "Binder returned from Shizuku was null or unresponsive to ping.")
                 userService = null
                 _isServiceBound.value = false
                 isConnecting.set(false)
@@ -139,7 +137,7 @@ class ShizukuAudioController private constructor(private val context: Context) {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            Log.w(TAG, "Privileged VoicemailUserService disconnected unexpectedly.")
+            Log.w(TAG, "Privileged VoicemailUserService disconnected.")
             userService = null
             _isServiceBound.value = false
             isConnecting.set(false)
@@ -149,6 +147,9 @@ class ShizukuAudioController private constructor(private val context: Context) {
 
     init {
         try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                runCatching { HiddenApiBypass.addHiddenApiExemptions("L") }
+            }
             Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
             Shizuku.addBinderDeadListener(binderDeadListener)
             Shizuku.addRequestPermissionResultListener(requestPermissionResultListener)
@@ -157,65 +158,101 @@ class ShizukuAudioController private constructor(private val context: Context) {
             Log.e(TAG, "Error registering Shizuku listeners", t)
         }
 
-        // Auto-bootstrap privileged daemon silently in background if root or Shizuku is present
         tryAutoBootstrapInternalService()
     }
 
-    /**
-     * Checks if Shizuku or root is available and automatically bootstraps privileged access
-     * without blocking or requiring user intervention.
-     */
+    fun grantPermanentStandalonePermissions(onCompleted: ((Boolean) -> Unit)? = null) {
+        controllerScope.launch(Dispatchers.IO) {
+            val success = executePermissionGrantCommands()
+            onCompleted?.let { cb ->
+                mainHandler.post { cb(success) }
+            }
+        }
+    }
+
+    private fun executePermissionGrantCommands(): Boolean {
+        val pkg = context.packageName
+        // Semicolon-separated commands so a non-changeable permission never aborts appops grants!
+        val cmds = listOf(
+            "appops set $pkg RECORD_AUDIO allow",
+            "appops set $pkg PLAY_AUDIO allow",
+            "appops set $pkg PROJECT_MEDIA allow",
+            "appops set $pkg SYSTEM_ALERT_WINDOW allow",
+            "appops set $pkg CAPTURE_AUDIO_OUTPUT allow",
+            "appops set $pkg MODIFY_AUDIO_ROUTING allow",
+            "cmd appops set com.android.shell RECORD_AUDIO allow",
+            "cmd appops set com.android.shell PLAY_AUDIO allow",
+            "cmd appops set com.android.shell CAPTURE_AUDIO_OUTPUT allow",
+            "cmd appops set com.android.shell MODIFY_AUDIO_ROUTING allow",
+            "pm grant $pkg android.permission.RECORD_AUDIO",
+            "pm grant $pkg android.permission.CALL_PHONE",
+            "pm grant $pkg android.permission.READ_PHONE_STATE",
+            "pm grant $pkg android.permission.READ_CALL_LOG",
+            "pm grant $pkg android.permission.WRITE_CALL_LOG",
+            "pm grant $pkg android.permission.READ_CONTACTS"
+        )
+        val grantCmd = cmds.joinToString(" ; ")
+
+        val isShizukuAvailable = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+        if (isShizukuAvailable) {
+            val hasShizukuPerm = runCatching {
+                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            }.getOrDefault(false)
+
+            if (hasShizukuPerm) {
+                try {
+                    val cmdArray = arrayOf("sh", "-c", grantCmd)
+                    val process: Process? = runCatching {
+                        HiddenApiBypass.invoke(
+                            Shizuku::class.java,
+                            null,
+                            "newProcess",
+                            cmdArray,
+                            null,
+                            null
+                        ) as Process
+                    }.getOrNull()
+                    process?.waitFor()
+                    return true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed executing Shizuku grant command: ${t.message}")
+                }
+            }
+        }
+
+        try {
+            val suProcess = Runtime.getRuntime().exec(arrayOf("su", "-c", grantCmd))
+            if (suProcess.waitFor() == 0) return true
+        } catch (ignored: Throwable) {}
+
+        return isBound
+    }
+
     fun tryAutoBootstrapInternalService() {
         controllerScope.launch {
             try {
                 val isShizukuRunning = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
                 if (isShizukuRunning) {
-                    Log.i(TAG, "Shizuku binder is active. Attempting auto-binding...")
                     updateShizukuStatus()
                     if (_isPermissionGranted.value) {
-                        bindUserService()
+                        grantPermanentStandalonePermissions {
+                            bindUserService()
+                        }
                     } else {
                         requestShizukuPermission()
                     }
                     return@launch
                 }
 
-                // Check for su (Root) availability
                 val suCandidates = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su")
-                val suBinary = suCandidates.firstOrNull { File(it).exists() }
-                if (suBinary != null) {
-                    Log.i(TAG, "su binary detected at $suBinary. Attempting internal permission auto-grant...")
-                    val pkg = context.packageName
-                    val grantCommands = arrayOf(
-                        "pm grant $pkg android.permission.CAPTURE_AUDIO_OUTPUT",
-                        "pm grant $pkg android.permission.MODIFY_AUDIO_ROUTING",
-                        "pm grant $pkg android.permission.MODIFY_PHONE_STATE",
-                        "appops set $pkg RECORD_AUDIO allow",
-                        "appops set $pkg PLAY_AUDIO allow",
-                        "appops set $pkg SYSTEM_ALERT_WINDOW allow"
-                    )
-
-                    val cmd = grantCommands.joinToString(" && ")
-                    val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-                    process.waitFor()
-                    Log.i(TAG, "su permission auto-grant completed with exitCode=${process.exitValue()}")
-
-                    val daemonScript = File("/data/local/tmp/start_voicemail_daemon.sh")
-                    if (daemonScript.exists()) {
-                        Runtime.getRuntime().exec(arrayOf("su", "-c", "sh /data/local/tmp/start_voicemail_daemon.sh"))
-                    }
-                } else {
-                    Log.d(TAG, "No root daemon detected. Using 100% standalone audio engine.")
+                val hasSuBinary = suCandidates.any { File(it).exists() }
+                if (hasSuBinary) {
+                    executePermissionGrantCommands()
                 }
-            } catch (t: Throwable) {
-                Log.d(TAG, "tryAutoBootstrapInternalService completed (standalone fallback active): ${t.message}")
-            }
+            } catch (ignored: Throwable) {}
         }
     }
 
-    /**
-     * Checks if Shizuku is currently operational on the device and whether permission is granted.
-     */
     fun updateShizukuStatus(): Boolean {
         return try {
             val isAvailable = Shizuku.pingBinder()
@@ -229,16 +266,12 @@ class ShizukuAudioController private constructor(private val context: Context) {
             _isPermissionGranted.value = hasPermission
             isAvailable && hasPermission
         } catch (t: Throwable) {
-            Log.w(TAG, "Exception querying Shizuku status: ${t.message}")
             _isShizukuInstalledAndRunning.value = false
             _isPermissionGranted.value = false
             false
         }
     }
 
-    /**
-     * Prompts the user to grant Shizuku permission.
-     */
     fun requestShizukuPermission(requestCode: Int = 1001) {
         try {
             if (Shizuku.pingBinder()) {
@@ -246,18 +279,14 @@ class ShizukuAudioController private constructor(private val context: Context) {
                     Shizuku.requestPermission(requestCode)
                 } else {
                     _isPermissionGranted.value = true
+                    grantPermanentStandalonePermissions {
+                        bindUserService()
+                    }
                 }
-            } else {
-                Log.d(TAG, "Cannot request permission: Shizuku binder is not running.")
             }
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed requesting Shizuku permission: ${t.message}")
-        }
+        } catch (ignored: Throwable) {}
     }
 
-    /**
-     * Spawns and binds to the privileged VoicemailUserService running under UID 2000.
-     */
     @Synchronized
     fun bindUserService(onConnected: ((IVoicemailAudioService?) -> Unit)? = null) {
         val current = userService
@@ -272,15 +301,8 @@ class ShizukuAudioController private constructor(private val context: Context) {
             }
         }
 
-        if (isConnecting.get()) {
-            Log.d(TAG, "UserService binding already in progress...")
-            return
-        }
-
-        if (!updateShizukuStatus()) {
-            Log.d(TAG, "Cannot bind UserService: Shizuku not running or permission not granted.")
-            return
-        }
+        if (isConnecting.get()) return
+        if (!updateShizukuStatus()) return
 
         isConnecting.set(true)
 
@@ -291,99 +313,60 @@ class ShizukuAudioController private constructor(private val context: Context) {
             .version(BuildConfig.VERSION_CODE)
 
         try {
-            Log.i(TAG, "Binding UserService with Shizuku: $componentName")
             Shizuku.bindUserService(args, serviceConnection)
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed invoking Shizuku.bindUserService", t)
             isConnecting.set(false)
             triggerAutoReconnect()
         }
     }
 
-    /**
-     * Unbinds the privileged UserService.
-     */
     @Synchronized
     fun unbindUserService(stopService: Boolean = false) {
         if (!_isServiceBound.value && userService == null) return
-
         val componentName = ComponentName(context.packageName, VoicemailUserService::class.java.name)
         val args = Shizuku.UserServiceArgs(componentName)
-
         try {
             Shizuku.unbindUserService(args, serviceConnection, stopService)
-            Log.i(TAG, "Shizuku.unbindUserService executed.")
-        } catch (t: Throwable) {
-            Log.w(TAG, "Exception unbinding Shizuku UserService: ${t.message}")
-        } finally {
+        } catch (ignored: Throwable) {} finally {
             userService = null
             _isServiceBound.value = false
             isConnecting.set(false)
         }
     }
 
-    /**
-     * Starts a voicemail screening session on the privileged service.
-     */
     fun startVoicemailSession(greetingFd: AssetFileDescriptor, callback: IAudioChunkCallback) {
         bindUserService { service ->
             if (service != null) {
                 try {
                     service.startVoicemailSession(greetingFd, callback)
-                    Log.i(TAG, "startVoicemailSession successfully dispatched to VoicemailUserService.")
                 } catch (e: RemoteException) {
-                    Log.e(TAG, "RemoteException invoking startVoicemailSession", e)
-                    try {
-                        callback.onError("RemoteException: ${e.message}")
-                    } catch (ignored: Throwable) {}
+                    try { callback.onError("RemoteException: ${e.message}") } catch (ignored: Throwable) {}
                 }
             } else {
-                Log.e(TAG, "VoicemailUserService unavailable for startVoicemailSession.")
-                try {
-                    callback.onError("VoicemailUserService unavailable or not bound")
-                } catch (ignored: Throwable) {}
+                try { callback.onError("VoicemailUserService unavailable") } catch (ignored: Throwable) {}
             }
         }
     }
 
-    /**
-     * Enables or disables live room listening of the screening call.
-     */
     fun setScreeningSpeakerEnabled(enabled: Boolean) {
-        val service = userService ?: return
         try {
-            service.setScreeningSpeakerEnabled(enabled)
-            Log.i(TAG, "setScreeningSpeakerEnabled($enabled) sent to VoicemailUserService.")
-        } catch (e: RemoteException) {
-            Log.e(TAG, "RemoteException calling setScreeningSpeakerEnabled", e)
-        }
+            userService?.setScreeningSpeakerEnabled(enabled)
+        } catch (ignored: RemoteException) {}
     }
 
-    /**
-     * Stops the active voicemail session and restores normal audio stream routing.
-     */
     fun stopVoicemailSession() {
-        val service = userService ?: return
         try {
-            service.stopVoicemailSession()
-            Log.i(TAG, "stopVoicemailSession sent to VoicemailUserService.")
-        } catch (e: RemoteException) {
-            Log.e(TAG, "RemoteException calling stopVoicemailSession", e)
-        }
+            userService?.stopVoicemailSession()
+        } catch (ignored: RemoteException) {}
     }
 
     private fun triggerAutoReconnect() {
         if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
             reconnectAttempts++
             val delayMs = BASE_RECONNECT_DELAY_MS * (1 shl (reconnectAttempts - 1))
-            Log.i(TAG, "Scheduling Shizuku UserService reconnect attempt $reconnectAttempts in ${delayMs}ms")
             mainHandler.postDelayed({
-                if (!_isServiceBound.value) {
-                    bindUserService()
-                }
+                if (!_isServiceBound.value) bindUserService()
             }, delayMs)
-        } else {
-            Log.d(TAG, "Max reconnect attempts reached for Shizuku UserService.")
         }
     }
 }

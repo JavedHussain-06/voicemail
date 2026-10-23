@@ -2,6 +2,8 @@ package com.personal.voicemail.recognition
 
 import android.content.Context
 import android.util.Log
+import com.k2fsa.sherpa.onnx.EndpointConfig
+import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
@@ -34,14 +36,15 @@ import kotlin.math.sqrt
 /**
  * Real-time Offline Speech-to-Text Transcriber and WAV Audio Recorder.
  *
- * Consumes 16kHz PCM chunks emitted by the privileged VoicemailUserService through a Kotlin
- * Channel on a single-threaded dispatcher (Dispatchers.Default.limitedParallelism(1)).
+ * Consumes 16kHz PCM chunks emitted by StandaloneTelephonyAudioEngine or VoicemailUserService
+ * through a Kotlin Channel on a single-threaded dispatcher.
  *
- * 1. Writes raw 16-bit little-endian PCM bytes to disk in real time.
- * 2. Normalizes samples to [-1.0f, 1.0f] and passes them to Sherpa-ONNX OnlineRecognizer.
- * 3. Decodes speech frames and detects sentence endpoints.
- * 4. Emits real-time accumulated transcripts to Compose UI via StateFlow.
- * 5. Upon session termination, prepends a 44-byte RIFF/WAVE header and stores the record in Room.
+ * Fixes all transcription lifecycle & emission issues:
+ * 1. Inside [consumeAudioChunks], dynamically creates [activeStream] on the fly if the model finishes
+ *    initializing mid-call, never stranding audio chunks.
+ * 2. Tunes [EndpointConfig] rules (rule1MinTrailingSilence = 1.2s, rule2MinTrailingSilence = 0.8s,
+ *    rule3MinUtteranceLength = 15s) so partial text updates emit smoothly in real time.
+ * 3. Robust asset detection checking both `model/` and root `assets/` directories.
  */
 class LiveVoicemailTranscriber(
     private val context: Context,
@@ -67,7 +70,9 @@ class LiveVoicemailTranscriber(
     private val transcriberScope = CoroutineScope(Dispatchers.Default)
     private val processingDispatcher = Dispatchers.Default.limitedParallelism(1)
 
+    @Volatile
     private var recognizer: OnlineRecognizer? = null
+    @Volatile
     private var isModelInitialized = false
 
     // Session State
@@ -80,6 +85,7 @@ class LiveVoicemailTranscriber(
     private val _audioRmsLevel = MutableStateFlow(0f)
     val audioRmsLevel: StateFlow<Float> = _audioRmsLevel.asStateFlow()
 
+    @Volatile
     private var activeStream: OnlineStream? = null
     private var pcmChannel: Channel<ShortArray>? = null
     private var consumerJob: Job? = null
@@ -92,6 +98,9 @@ class LiveVoicemailTranscriber(
     private var currentPhoneNumber: String = ""
     private var currentSimDisplayName: String = "SIM 1"
     private var currentSimSlotIndex: Int = 0
+
+    @Volatile
+    private var peakSessionAmplitude: Int = 0
 
     private val accumulatedSentences = StringBuilder()
     private val isStopping = AtomicBoolean(false)
@@ -108,6 +117,7 @@ class LiveVoicemailTranscriber(
      * with assetManager = null to prevent AAssetManager native crashes on Android 14/15.
      */
     fun initializeRecognizer() {
+        if (isModelInitialized && recognizer != null) return
         transcriberScope.launch(Dispatchers.IO) {
             try {
                 Log.d(TAG, "Starting Sherpa-ONNX Zipformer model extraction and initialization...")
@@ -122,21 +132,27 @@ class LiveVoicemailTranscriber(
 
                 for (name in requiredFiles) {
                     val dest = File(targetDir, name)
-                    // If file doesn't exist or is empty, copy from assets
                     if (!dest.exists() || dest.length() <= 0L) {
-                        try {
-                            Log.d(TAG, "Extracting asset $MODEL_DIR/$name -> ${dest.absolutePath}")
-                            context.assets.open("$MODEL_DIR/$name").use { input ->
-                                FileOutputStream(dest).use { output ->
-                                    input.copyTo(output)
+                        // Check both "model/<name>" and "<name>" in assets
+                        val candidatePaths = listOf("$MODEL_DIR/$name", name)
+                        var copied = false
+                        for (assetPath in candidatePaths) {
+                            try {
+                                context.assets.open(assetPath).use { input ->
+                                    FileOutputStream(dest).use { output ->
+                                        input.copyTo(output)
+                                    }
                                 }
+                                Log.d(TAG, "Extracted $assetPath -> ${dest.absolutePath} (${dest.length()} bytes)")
+                                copied = true
+                                break
+                            } catch (e: Exception) {
+                                // Try next candidate path
                             }
-                            Log.d(TAG, "Extracted $name (${dest.length()} bytes)")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed extracting $name from assets: ${e.message}")
                         }
-                    } else {
-                        Log.d(TAG, "Model file $name already exists (${dest.length()} bytes)")
+                        if (!copied) {
+                            Log.w(TAG, "Failed finding/extracting $name from assets in candidates $candidatePaths")
+                        }
                     }
                     if (dest.exists() && dest.length() > 0L) {
                         modelFiles[name] = dest
@@ -149,8 +165,6 @@ class LiveVoicemailTranscriber(
                 val tokensFile = modelFiles["tokens.txt"]
 
                 if (encoderFile != null && decoderFile != null && joinerFile != null && tokensFile != null) {
-                    Log.d(TAG, "Configuring Zipformer transducer...")
-
                     val transducerConfig = OnlineTransducerModelConfig(
                         encoder = encoderFile.absolutePath,
                         decoder = decoderFile.absolutePath,
@@ -165,13 +179,20 @@ class LiveVoicemailTranscriber(
                         debug = false
                     )
 
+                    // Real-time endpoint config for Live Voicemail
+                    val endpointConfig = EndpointConfig(
+                        rule1 = EndpointRule(mustContainNonSilence = false, minTrailingSilence = 1.2f, minUtteranceLength = 0.0f),
+                        rule2 = EndpointRule(mustContainNonSilence = true, minTrailingSilence = 0.8f, minUtteranceLength = 0.0f),
+                        rule3 = EndpointRule(mustContainNonSilence = false, minTrailingSilence = 0.0f, minUtteranceLength = 15.0f)
+                    )
+
                     val recognizerConfig = OnlineRecognizerConfig(
                         modelConfig = modelConfig,
+                        endpointConfig = endpointConfig,
                         decodingMethod = "greedy_search",
                         enableEndpoint = true
                     )
 
-                    Log.d(TAG, "Instantiating OnlineRecognizer native instance...")
                     recognizer = OnlineRecognizer(
                         assetManager = null,
                         config = recognizerConfig
@@ -205,6 +226,7 @@ class LiveVoicemailTranscriber(
         currentSimDisplayName = simDisplayName
         currentSimSlotIndex = simSlotIndex
         sessionStartTimeMs = System.currentTimeMillis()
+        peakSessionAmplitude = 0
 
         accumulatedSentences.clear()
         _liveTranscript.value = ""
@@ -214,39 +236,42 @@ class LiveVoicemailTranscriber(
 
         val recordingsDir = File(context.filesDir, RECORDINGS_DIR).apply { mkdirs() }
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val cleanNumber = phoneNumber.replace(Regex("[^0-9+]"), "")
+        val cleanNumber = phoneNumber.replace(Regex("[^0-9+]"), "").ifEmpty { "unknown" }
         val baseFileName = "voicemail_${cleanNumber}_$timeStamp"
 
         tempPcmFile = File(recordingsDir, "$baseFileName.pcm")
         tempPcmOutputStream = FileOutputStream(tempPcmFile!!)
 
-        // Allocate unbounded channel for high-throughput 16kHz PCM short arrays
         val channel = Channel<ShortArray>(Channel.UNLIMITED)
         pcmChannel = channel
 
-        // Create Sherpa-ONNX streaming instance
         activeStream = recognizer?.createStream()
 
-        // Launch consumer coroutine on single-threaded dispatcher
         consumerJob = transcriberScope.launch(processingDispatcher) {
             consumeAudioChunks(channel)
         }
 
-        Log.i(TAG, "Live Voicemail transcription session commenced for $phoneNumber")
+        Log.i(TAG, "Live Voicemail transcription session commenced for $phoneNumber (activeStreamCreated=${activeStream != null})")
     }
 
     /**
      * Consumer loop: receives 16kHz PCM chunks, writes raw bytes, feeds Sherpa-ONNX stream.
+     * Dynamically instantiates [activeStream] on the fly inside the loop if the model was still
+     * initializing when the call was answered.
      */
     private suspend fun consumeAudioChunks(channel: Channel<ShortArray>) {
-        val stream = activeStream
-        val rec = recognizer
-        val byteBuffer = ByteBuffer.allocate(1600 * 2).order(ByteOrder.LITTLE_ENDIAN)
+        var chunkCounter = 0
 
         for (chunk in channel) {
+            if (chunk.isEmpty()) continue
+
             // 1. Write raw PCM to temporary disk file
-            byteBuffer.clear()
+            val byteBuffer = ByteBuffer.allocate(chunk.size * 2).order(ByteOrder.LITTLE_ENDIAN)
             for (sample in chunk) {
+                val absSample = abs(sample.toInt())
+                if (absSample > peakSessionAmplitude) {
+                    peakSessionAmplitude = absSample
+                }
                 byteBuffer.putShort(sample)
             }
             try {
@@ -259,13 +284,26 @@ class LiveVoicemailTranscriber(
             val rms = calculateRms(chunk)
             _audioRmsLevel.value = rms
 
+            chunkCounter++
+            if (chunkCounter % 20 == 0) {
+                Log.d(TAG, "Transcriber chunk #$chunkCounter processed: samples=${chunk.size}, rms=$rms, sessionPeak=$peakSessionAmplitude")
+            }
+
             // 3. Normalize samples to FloatArray [-1.0f, 1.0f]
             val floatSamples = FloatArray(chunk.size)
             for (i in chunk.indices) {
                 floatSamples[i] = chunk[i] / 32768.0f
             }
 
-            // 4. Feed Sherpa-ONNX OnlineStream
+            // 4. Dynamic model/stream binding: create stream on the fly if model just finished loading!
+            val rec = recognizer
+            if (rec != null && activeStream == null && !isStopping.get()) {
+                activeStream = rec.createStream()
+                Log.i(TAG, "Active OnlineStream instantiated dynamically on chunk arrival!")
+            }
+            val stream = activeStream
+
+            // 5. Feed Sherpa-ONNX OnlineStream
             if (rec != null && stream != null) {
                 stream.acceptWaveform(floatSamples, SAMPLE_RATE_HZ)
 
@@ -296,8 +334,7 @@ class LiveVoicemailTranscriber(
                     _liveTranscript.value = fullDisplay
                 }
             } else {
-                // Fallback simulation when model weights are not loaded: speech activity indicators
-                if (rms > 0.15f) {
+                if (rms > 0.08f) {
                     val current = _liveTranscript.value
                     if (!current.contains("…")) {
                         _liveTranscript.value = if (current.isEmpty()) "Speaking…" else "$current …"
@@ -306,11 +343,11 @@ class LiveVoicemailTranscriber(
             }
         }
 
-        Log.i(TAG, "Consumer coroutine completed chunk processing loop.")
+        Log.i(TAG, "Consumer coroutine completed chunk processing loop (totalChunks=$chunkCounter, peakAmp=$peakSessionAmplitude).")
     }
 
     /**
-     * Submits a chunk of 16kHz linear PCM samples received via AIDL from VoicemailUserService.
+     * Submits a chunk of 16kHz linear PCM samples received from the audio engine.
      */
     fun submitPcmChunk(pcm16kHzSamples: ShortArray) {
         if (!isStopping.get()) {
@@ -331,17 +368,14 @@ class LiveVoicemailTranscriber(
         isStopping.set(true)
         _isScreeningActive.value = false
 
-        // Close channel and wait for background consumer to finish writing
         pcmChannel?.close()
         consumerJob?.join()
         pcmChannel = null
         consumerJob = null
 
-        // Release Sherpa stream
         try {
             activeStream?.let { s ->
                 recognizer?.let { r ->
-                    // Flush any remaining samples
                     while (r.isReady(s)) {
                         r.decode(s)
                     }
@@ -361,7 +395,6 @@ class LiveVoicemailTranscriber(
             activeStream = null
         }
 
-        // Close PCM output stream
         try {
             tempPcmOutputStream?.flush()
             tempPcmOutputStream?.close()
@@ -379,7 +412,6 @@ class LiveVoicemailTranscriber(
             return@withContext null
         }
 
-        // Convert raw .pcm to standard playable .wav
         val recordingsDir = File(context.filesDir, RECORDINGS_DIR).apply { mkdirs() }
         val cleanNumber = currentPhoneNumber.replace(Regex("[^0-9+]"), "").ifEmpty { "unknown" }
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(sessionStartTimeMs))
@@ -402,12 +434,11 @@ class LiveVoicemailTranscriber(
                     fos.flush()
                 }
                 pcm.delete()
-                Log.i(TAG, "Produced final WAV: ${finalWavFile.absolutePath} (${finalWavFile.length()} bytes)")
+                Log.i(TAG, "Produced final WAV: ${finalWavFile.absolutePath} (${finalWavFile.length()} bytes, peakAmp=$peakSessionAmplitude)")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed creating WAV container from raw PCM file", e)
             }
         } else {
-            // Guarantee a valid 1-second WAV file exists even if call disconnected immediately
             try {
                 val silenceBytes = ByteArray(SAMPLE_RATE_HZ * 2)
                 FileOutputStream(finalWavFile).use { fos ->
@@ -430,7 +461,11 @@ class LiveVoicemailTranscriber(
 
         val durationSec = kotlin.math.max(1, (pcmLength / (SAMPLE_RATE_HZ * 2L)).toInt())
         val finalTranscript = accumulatedSentences.toString().trim()
-            .ifEmpty { if (isPickedUp) "" else "(Voice message recorded — tap Play to listen)" }
+            .ifEmpty {
+                if (isPickedUp) ""
+                else if (peakSessionAmplitude <= 10) "(Caller did not leave a spoken message)"
+                else "(Voice message recorded — tap Play to listen)"
+            }
 
         val entity = VoicemailEntity(
             callerName = currentCallerName,
@@ -445,7 +480,6 @@ class LiveVoicemailTranscriber(
             isPickedUp = isPickedUp
         )
 
-        // Persist to database & update StateFlow
         val id = repository.addVoicemail(entity)
         val persisted = entity.copy(id = id)
 

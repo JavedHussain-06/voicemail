@@ -1,9 +1,7 @@
 package com.personal.voicemail.ui.screens
 
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.provider.CallLog
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -19,16 +17,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallMade
-import androidx.compose.material.icons.filled.CallMissed
-import androidx.compose.material.icons.filled.CallReceived
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -46,12 +44,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.personal.voicemail.ui.components.GlassmorphicCard
 import com.personal.voicemail.ui.theme.AccentBlue
-import com.personal.voicemail.ui.theme.CallAcceptGreen
-import com.personal.voicemail.ui.theme.CallEndRed
-import com.personal.voicemail.ui.theme.GlassBorder
-import com.personal.voicemail.ui.theme.GlassSurface
+import com.personal.voicemail.ui.theme.DarkBackground
 import com.personal.voicemail.ui.theme.TextPrimary
 import com.personal.voicemail.ui.theme.TextSecondary
 import kotlinx.coroutines.Dispatchers
@@ -92,87 +86,91 @@ fun RecentsTab(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp)
+            .background(DarkBackground)
     ) {
-        // Header Row with Filter Segment (All vs Missed)
-        Row(
+        // iOS Top Segmented Control (All | Missed)
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(top = 8.dp, bottom = 4.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Text(
-                text = "Recents",
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
-                color = TextPrimary
-            )
-
-            // Segmented Switch
             Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(GlassSurface)
-                    .padding(3.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF1C1C1E))
+                    .padding(2.dp)
             ) {
+                // "All" segment
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (!filterMissedOnly) Color(0x4DFFFFFF) else Color.Transparent)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(if (!filterMissedOnly) Color(0xFF636366) else Color.Transparent)
                         .clickable { filterMissedOnly = false }
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .padding(horizontal = 22.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = "All",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (!filterMissedOnly) Color.White else TextSecondary
+                        fontSize = 13.sp,
+                        fontWeight = if (!filterMissedOnly) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (!filterMissedOnly) Color.White else Color(0xFF8E8E93)
                     )
                 }
 
+                // "Missed" segment
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (filterMissedOnly) Color(0x4DFFFFFF) else Color.Transparent)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(if (filterMissedOnly) Color(0xFF636366) else Color.Transparent)
                         .clickable { filterMissedOnly = true }
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .padding(horizontal = 20.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = "Missed",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (filterMissedOnly) Color.White else TextSecondary
+                        fontSize = 13.sp,
+                        fontWeight = if (filterMissedOnly) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (filterMissedOnly) Color.White else Color(0xFF8E8E93)
                     )
                 }
             }
         }
 
+        // iOS Large Navigation Title
+        Text(
+            text = "Recents",
+            fontSize = 34.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+        )
+
         if (filteredList.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(bottom = 80.dp),
+                    .padding(bottom = 60.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Box(
                         modifier = Modifier
-                            .size(72.dp)
+                            .size(64.dp)
                             .clip(CircleShape)
-                            .background(GlassSurface),
+                            .background(Color(0xFF1C1C1E)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.History,
                             contentDescription = null,
-                            tint = TextSecondary,
-                            modifier = Modifier.size(36.dp)
+                            tint = Color(0xFF8E8E93),
+                            modifier = Modifier.size(32.dp)
                         )
                     }
                     Spacer(modifier = Modifier.height(14.dp))
                     Text(
-                        text = if (filterMissedOnly) "No Missed Calls" else "No Recent Calls",
+                        text = if (filterMissedOnly) "No Missed Calls" else "No Recents",
                         fontSize = 17.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = TextPrimary
@@ -181,13 +179,19 @@ fun RecentsTab(
             }
         } else {
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.fillMaxSize()
             ) {
-                items(filteredList, key = { it.id }) { call ->
-                    CallLogItemCard(
+                itemsIndexed(filteredList, key = { _, call -> call.id }) { index, call ->
+                    IOSRecentsRow(
                         entry = call,
-                        onClick = { onCallNumber(call.number) }
+                        onClick = { onCallNumber(call.number) },
+                        onInfoClick = { onCallNumber(call.number) }
+                    )
+                    // Indented hairline separator like iOS
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 16.dp),
+                        thickness = 0.5.dp,
+                        color = Color(0x38545458)
                     )
                 }
 
@@ -200,80 +204,94 @@ fun RecentsTab(
 }
 
 @Composable
-private fun CallLogItemCard(
+private fun IOSRecentsRow(
     entry: CallLogEntry,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onInfoClick: () -> Unit
 ) {
     val isMissed = entry.type == CallLog.Calls.MISSED_TYPE || entry.type == CallLog.Calls.REJECTED_TYPE
-    val icon = when (entry.type) {
-        CallLog.Calls.OUTGOING_TYPE -> Icons.Default.CallMade
-        CallLog.Calls.MISSED_TYPE -> Icons.Default.CallMissed
-        CallLog.Calls.REJECTED_TYPE -> Icons.Default.CallMissed
-        else -> Icons.Default.CallReceived
-    }
-    val iconTint = when (entry.type) {
-        CallLog.Calls.OUTGOING_TYPE -> AccentBlue
-        CallLog.Calls.MISSED_TYPE, CallLog.Calls.REJECTED_TYPE -> CallEndRed
-        else -> CallAcceptGreen
-    }
+    val isOutgoing = entry.type == CallLog.Calls.OUTGOING_TYPE
 
-    GlassmorphicCard(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() },
-        cornerRadius = 16.dp
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+        // Left Column: Contact Name / Number + Call Type
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.Center
         ) {
+            val titleText = entry.name ?: entry.number
+            Text(
+                text = titleText,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (isMissed) Color(0xFFFF453A) else Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
             Row(
-                modifier = Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(top = 2.dp)
             ) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = iconTint,
-                    modifier = Modifier.size(20.dp)
-                )
-
-                Spacer(modifier = Modifier.width(12.dp))
-
-                Column {
-                    Text(
-                        text = entry.name ?: entry.number,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (isMissed) CallEndRed else TextPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                if (isOutgoing) {
+                    Icon(
+                        imageVector = Icons.Default.CallMade,
+                        contentDescription = null,
+                        tint = Color(0xFF8E8E93),
+                        modifier = Modifier
+                            .size(13.dp)
+                            .padding(end = 4.dp)
                     )
-                    if (!entry.name.isNullOrBlank()) {
-                        Text(
-                            text = entry.number,
-                            fontSize = 12.sp,
-                            color = TextSecondary
-                        )
+                }
+
+                val subtext = if (!entry.name.isNullOrBlank()) {
+                    entry.number
+                } else {
+                    when (entry.type) {
+                        CallLog.Calls.OUTGOING_TYPE -> "Outgoing Call"
+                        CallLog.Calls.MISSED_TYPE, CallLog.Calls.REJECTED_TYPE -> "Missed Call"
+                        else -> "Incoming Call"
                     }
                 }
-            }
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = formatLogDate(entry.date),
-                    fontSize = 12.sp,
-                    color = TextSecondary
+                    text = subtext,
+                    fontSize = 13.sp,
+                    color = Color(0xFF8E8E93),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                Spacer(modifier = Modifier.width(10.dp))
+            }
+        }
+
+        // Right Column: Date/Time + iOS Info Button (i)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End
+        ) {
+            Text(
+                text = formatLogDate(entry.date),
+                fontSize = 14.sp,
+                color = Color(0xFF8E8E93)
+            )
+
+            Spacer(modifier = Modifier.width(10.dp))
+
+            IconButton(
+                onClick = onInfoClick,
+                modifier = Modifier.size(24.dp)
+            ) {
                 Icon(
-                    imageVector = Icons.Default.Call,
-                    contentDescription = "Callback",
+                    imageVector = Icons.Outlined.Info,
+                    contentDescription = "Details",
                     tint = AccentBlue,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(22.dp)
                 )
             }
         }
@@ -352,6 +370,11 @@ private fun formatLogDate(dateMs: Long): String {
     ) {
         SimpleDateFormat("h:mm a", Locale.getDefault()).format(date)
     } else {
-        SimpleDateFormat("MMM d", Locale.getDefault()).format(date)
+        val diffDays = (now.time - dateMs) / (1000 * 60 * 60 * 24)
+        if (diffDays < 7) {
+            SimpleDateFormat("EEEE", Locale.getDefault()).format(date)
+        } else {
+            SimpleDateFormat("MM/dd/yy", Locale.getDefault()).format(date)
+        }
     }
 }

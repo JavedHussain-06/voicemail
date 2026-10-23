@@ -34,10 +34,12 @@
     <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL"
         tools:ignore="ProtectedPermissions" />
 
-    <!-- Privileged permissions declared for documentation (granted via UID 2000 shell process) -->
-    <!-- android.permission.CAPTURE_AUDIO_OUTPUT -->
-    <!-- android.permission.MODIFY_AUDIO_ROUTING -->
-    <!-- android.permission.MODIFY_PHONE_STATE -->
+    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_ROUTING"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.MODIFY_PHONE_STATE"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:name=".VoicemailApplication"
@@ -102,6 +104,7 @@
             android:name=".service.VoicemailInCallService"
             android:permission="android.permission.BIND_INCALL_SERVICE"
             android:foregroundServiceType="phoneCall|microphone"
+            android:directBootAware="true"
             android:exported="true">
             <meta-data
                 android:name="android.telecom.IN_CALL_SERVICE_UI"
@@ -126,10 +129,12 @@
         <!-- Auto-Boot & Background Persistence Receiver -->
         <receiver
             android:name=".service.BootCompletedReceiver"
+            android:directBootAware="true"
             android:exported="true"
             android:enabled="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
@@ -155,6 +160,7 @@
         <service
             android:name=".service.VoicemailAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:directBootAware="true"
             android:isAccessibilityTool="true"
             android:exported="true">
             <intent-filter>

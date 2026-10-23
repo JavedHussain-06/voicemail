@@ -44,6 +44,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Slider
@@ -77,6 +78,7 @@ import com.personal.voicemail.ui.components.SimBadge
 import com.personal.voicemail.ui.theme.AccentBlue
 import com.personal.voicemail.ui.theme.CallAcceptGreen
 import com.personal.voicemail.ui.theme.CallEndRed
+import com.personal.voicemail.ui.theme.DarkBackground
 import com.personal.voicemail.ui.theme.DarkSurfaceElevated
 import com.personal.voicemail.ui.theme.GlassBorder
 import com.personal.voicemail.ui.theme.GlassSurface
@@ -104,81 +106,69 @@ fun VoicemailInboxTab(
     var activePlayingId by remember { mutableStateOf<Long?>(null) }
     var showGreetingDialog by remember { mutableStateOf(false) }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    Box(modifier = modifier.fillMaxSize().background(DarkBackground)) {
         Column(modifier = Modifier.fillMaxSize()) {
 
-            // Header Row with Title and "Custom Greeting" Action Button
+            // iOS Top Header Bar with "Greeting" button on the left and space for top-right menu
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Voicemails",
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = TextPrimary
+                    text = "Greeting",
+                    fontSize = 17.sp,
+                    color = AccentBlue,
+                    fontWeight = FontWeight.Normal,
+                    modifier = Modifier.clickable { showGreetingDialog = true }
                 )
-
-                Button(
-                    onClick = { showGreetingDialog = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = GlassSurface),
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.border(1.dp, GlassBorder, RoundedCornerShape(16.dp))
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.RecordVoiceOver,
-                        contentDescription = null,
-                        tint = AccentBlue,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Greeting",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White
-                    )
-                }
+                Spacer(modifier = Modifier.width(1.dp))
             }
+
+            Text(
+                text = "Voicemail",
+                fontSize = 34.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+            )
 
             if (voicemails.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(bottom = 80.dp),
+                        .padding(bottom = 60.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(
                             modifier = Modifier
-                                .size(80.dp)
+                                .size(64.dp)
                                 .clip(CircleShape)
-                                .background(GlassSurface)
-                                .border(1.dp, GlassBorder, CircleShape),
+                                .background(Color(0xFF1C1C1E)),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Voicemail,
                                 contentDescription = null,
-                                tint = TextSecondary,
-                                modifier = Modifier.size(40.dp)
+                                tint = Color(0xFF8E8E93),
+                                modifier = Modifier.size(32.dp)
                             )
                         }
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
                         Text(
-                            text = "No Live Voicemails",
-                            fontSize = 18.sp,
+                            text = "No Voicemail",
+                            fontSize = 17.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = TextPrimary
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "Calls answered by Live Voicemail will appear here with audio and transcripts.",
+                            text = "Calls answered by Live Voicemail will appear here.",
                             fontSize = 13.sp,
-                            color = TextSecondary,
+                            color = Color(0xFF8E8E93),
                             modifier = Modifier.padding(horizontal = 40.dp),
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center
                         )
@@ -186,13 +176,10 @@ fun VoicemailInboxTab(
                 }
             } else {
                 LazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    modifier = Modifier.fillMaxSize()
                 ) {
                     items(voicemails, key = { it.id }) { item ->
-                        VoicemailItemCard(
+                        IOSVoicemailRow(
                             voicemail = item,
                             isPlaying = activePlayingId == item.id,
                             onPlayToggle = {
@@ -204,6 +191,11 @@ fun VoicemailInboxTab(
                             onDelete = {
                                 scope.launch { repository.deleteVoicemail(item) }
                             }
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.padding(start = 16.dp),
+                            thickness = 0.5.dp,
+                            color = Color(0x38545458)
                         )
                     }
 
@@ -224,7 +216,7 @@ fun VoicemailInboxTab(
 }
 
 @Composable
-private fun VoicemailItemCard(
+private fun IOSVoicemailRow(
     voicemail: VoicemailEntity,
     isPlaying: Boolean,
     onPlayToggle: () -> Unit,
@@ -232,85 +224,89 @@ private fun VoicemailItemCard(
 ) {
     var isExpanded by remember { mutableStateOf(false) }
 
-    GlassmorphicCard(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .animateContentSize(),
-        cornerRadius = 20.dp
+            .clickable { isExpanded = !isExpanded }
+            .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
+        // Main Summary Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            // Header Row: Caller, SIM badge, Date
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Top
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = voicemail.callerName ?: voicemail.phoneNumber,
-                            fontSize = 17.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = TextPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        if (!voicemail.isRead) {
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(AccentBlue)
-                            )
-                        }
-                    }
+                if (!voicemail.isRead) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(AccentBlue)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                }
 
+                Column {
+                    Text(
+                        text = voicemail.callerName ?: voicemail.phoneNumber,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                     if (!voicemail.callerName.isNullOrBlank()) {
                         Text(
                             text = voicemail.phoneNumber,
                             fontSize = 13.sp,
-                            color = TextSecondary
+                            color = Color(0xFF8E8E93)
                         )
                     }
                 }
+            }
 
-                Column(horizontalAlignment = Alignment.End) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (voicemail.simSlotIndex >= 0) {
                     SimBadge(
                         simName = voicemail.simDisplayName,
                         simSlotIndex = voicemail.simSlotIndex
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = formatDate(voicemail.timestamp),
-                        fontSize = 11.sp,
-                        color = TextSecondary
-                    )
+                    Spacer(modifier = Modifier.width(8.dp))
                 }
+                Text(
+                    text = formatDate(voicemail.timestamp),
+                    fontSize = 14.sp,
+                    color = Color(0xFF8E8E93)
+                )
             }
+        }
 
+        // Expanded Section: Transcript and Audio Player
+        if (isExpanded) {
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Transcript text (collapsible/expandable)
-            Text(
-                text = voicemail.transcript.ifBlank { "[No audible speech recorded]" },
-                fontSize = 14.sp,
-                lineHeight = 20.sp,
-                color = if (voicemail.transcript.isBlank()) TextSecondary else TextPrimary,
-                maxLines = if (isExpanded) 20 else 2,
-                overflow = TextOverflow.Ellipsis,
+            // Transcript Box
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { isExpanded = !isExpanded }
-            )
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF1C1C1E))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = voicemail.transcript.ifBlank { "[No speech transcript recorded]" },
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                    color = if (voicemail.transcript.isBlank()) Color(0xFF8E8E93) else Color(0xFFE5E5EA)
+                )
+            }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            // Audio Player Control Row
             VoicemailAudioPlayerRow(
                 audioPath = voicemail.audioFilePath,
                 durationSeconds = voicemail.durationSeconds,
@@ -343,6 +339,11 @@ private fun VoicemailAudioPlayerRow(
             try {
                 val mp = MediaPlayer().apply {
                     setDataSource(audioPath)
+                    setOnErrorListener { _, what, extra ->
+                        Log.e("VoicemailPlayer", "MediaPlayer playback error: what=$what extra=$extra")
+                        onPlayToggle()
+                        true
+                    }
                     prepare()
                     totalDurationMs = duration
                     start()
@@ -365,6 +366,7 @@ private fun VoicemailAudioPlayerRow(
                 mainHandler.post(progressRunnable)
             } catch (e: Exception) {
                 Log.e("VoicemailPlayer", "Error initializing MediaPlayer for $audioPath", e)
+                onPlayToggle()
             }
         } else {
             mainHandler.removeCallbacksAndMessages(null)
@@ -473,7 +475,7 @@ private fun VoicemailAudioPlayerRow(
 }
 
 @Composable
-private fun CustomGreetingDialog(
+fun CustomGreetingDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -628,6 +630,10 @@ private fun CustomGreetingDialog(
                 // 2. Regenerate Voice Greeting Button (TTS)
                 Button(
                     onClick = {
+                        activePlayer?.stop()
+                        activePlayer?.release()
+                        activePlayer = null
+                        isPlayingGreeting = false
                         isRegenerating = true
                         GreetingGenerator.generateVoiceGreetingTts(context) { success ->
                             isRegenerating = false
