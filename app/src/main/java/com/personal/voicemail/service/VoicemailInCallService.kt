@@ -1,14 +1,17 @@
 package com.personal.voicemail.service
 
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.CallLog
 import android.provider.ContactsContract
 import android.telecom.Call
 import android.telecom.CallAudioState
@@ -654,6 +657,8 @@ class VoicemailInCallService : InCallService() {
 
         val wasScreening = isVoicemailScreeningActive || isScreeningSessionRunning.get()
         val wasGreetingPlaying = !isGreetingFinished.get()
+        val targetNumber = TelecomCallManager.phoneNumber.value
+        val callCreationTime = activeCall?.details?.creationTimeMillis?.takeIf { it > 0 } ?: System.currentTimeMillis()
 
         isVoicemailScreeningActive = false
         isScreeningSessionRunning.set(false)
@@ -672,6 +677,9 @@ class VoicemailInCallService : InCallService() {
         appScope.launch(NonCancellable) {
             try {
                 if (wasScreening) {
+                    if (!isPickedUp) {
+                        markCallAsMissedInCallLog(targetNumber, callCreationTime)
+                    }
                     val voicemail = transcriber.stopSession(isPickedUp = isPickedUp, saveToRepository = true)
                     if (voicemail != null) {
                         if (wasGreetingPlaying && !isPickedUp) {
@@ -930,6 +938,99 @@ class VoicemailInCallService : InCallService() {
             displayName to slotIndex
         } catch (t: Throwable) {
             "SIM 1" to 0
+        }
+    }
+
+    private fun markCallAsMissedInCallLog(phoneNumber: String, callStartTimeMs: Long) {
+        if (checkSelfPermission(android.Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "Cannot mark call as missed in CallLog: WRITE_CALL_LOG permission not granted")
+            return
+        }
+
+        appScope.launch(Dispatchers.IO) {
+            val cleanTarget = phoneNumber.replace(Regex("[^0-9+]"), "")
+            var updated = false
+
+            // Retry over 3 seconds to ensure Android Telecom finishes writing the CallLog row first
+            for (attempt in 1..4) {
+                delay(if (attempt == 1) 350L else 700L)
+                try {
+                    val projection = arrayOf(
+                        CallLog.Calls._ID,
+                        CallLog.Calls.NUMBER,
+                        CallLog.Calls.DATE,
+                        CallLog.Calls.TYPE
+                    )
+                    contentResolver.query(
+                        CallLog.Calls.CONTENT_URI,
+                        projection,
+                        null,
+                        null,
+                        "${CallLog.Calls.DATE} DESC LIMIT 10"
+                    )?.use { cursor ->
+                        val colId = cursor.getColumnIndex(CallLog.Calls._ID)
+                        val colNumber = cursor.getColumnIndex(CallLog.Calls.NUMBER)
+                        val colDate = cursor.getColumnIndex(CallLog.Calls.DATE)
+                        val colType = cursor.getColumnIndex(CallLog.Calls.TYPE)
+
+                        while (cursor.moveToNext()) {
+                            val id = cursor.getLong(colId)
+                            val num = cursor.getString(colNumber).orEmpty()
+                            val date = cursor.getLong(colDate)
+                            val type = cursor.getInt(colType)
+
+                            val cleanNum = num.replace(Regex("[^0-9+]"), "")
+                            val matchesNumber = (cleanTarget.isNotBlank() && (cleanNum.endsWith(cleanTarget) || cleanTarget.endsWith(cleanNum)))
+                                    || cleanTarget.isBlank()
+                            val isWithinTime = kotlin.math.abs(date - callStartTimeMs) < 120_000L
+
+                            if (matchesNumber && isWithinTime) {
+                                if (type != CallLog.Calls.MISSED_TYPE) {
+                                    val values = ContentValues().apply {
+                                        put(CallLog.Calls.TYPE, CallLog.Calls.MISSED_TYPE)
+                                        put(CallLog.Calls.IS_READ, 0)
+                                        put(CallLog.Calls.NEW, 1)
+                                    }
+                                    val rows = contentResolver.update(
+                                        CallLog.Calls.CONTENT_URI,
+                                        values,
+                                        "${CallLog.Calls._ID} = ?",
+                                        arrayOf(id.toString())
+                                    )
+                                    Log.i(TAG, "Updated CallLog #$id ($num) to MISSED_TYPE (rows affected=$rows)")
+                                    updated = true
+                                } else {
+                                    Log.d(TAG, "CallLog #$id ($num) already recorded as MISSED_TYPE")
+                                    updated = true
+                                }
+                                break
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Error updating CallLog entry to MISSED_TYPE: ${t.message}")
+                }
+
+                if (updated) break
+            }
+
+            // Fallback: If Telecom did not insert a CallLog entry within the window, insert a missed call record directly
+            if (!updated && cleanTarget.isNotBlank()) {
+                try {
+                    val values = ContentValues().apply {
+                        put(CallLog.Calls.NUMBER, phoneNumber)
+                        put(CallLog.Calls.DATE, callStartTimeMs)
+                        put(CallLog.Calls.DURATION, 0)
+                        put(CallLog.Calls.TYPE, CallLog.Calls.MISSED_TYPE)
+                        put(CallLog.Calls.NEW, 1)
+                        put(CallLog.Calls.IS_READ, 0)
+                    }
+                    contentResolver.insert(CallLog.Calls.CONTENT_URI, values)
+                    Log.i(TAG, "Inserted fallback MISSED_TYPE call log entry for $phoneNumber")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed inserting fallback CallLog entry: ${t.message}")
+                }
+            }
         }
     }
 }

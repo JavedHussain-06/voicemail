@@ -2,6 +2,9 @@ package com.personal.voicemail.ui.screens
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
 import android.provider.CallLog
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -29,17 +32,23 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -70,11 +79,48 @@ fun RecentsTab(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     var callLogs by remember { mutableStateOf<List<CallLogEntry>>(emptyList()) }
     var filterMissedOnly by remember { mutableStateOf(false) }
 
+    fun refreshLogs() {
+        coroutineScope.launch {
+            callLogs = fetchCallLogs(context)
+        }
+    }
+
     LaunchedEffect(Unit) {
-        callLogs = fetchCallLogs(context)
+        refreshLogs()
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                super.onChange(selfChange)
+                refreshLogs()
+            }
+        }
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshLogs()
+            }
+        }
+
+        runCatching {
+            context.contentResolver.registerContentObserver(
+                CallLog.Calls.CONTENT_URI,
+                true,
+                observer
+            )
+        }
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
+
+        onDispose {
+            runCatching { context.contentResolver.unregisterContentObserver(observer) }
+            lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
+        }
     }
 
     val filteredList = if (filterMissedOnly) {
@@ -251,7 +297,7 @@ private fun IOSRecentsRow(
                 }
 
                 val subtext = if (!entry.name.isNullOrBlank()) {
-                    entry.number
+                    if (isMissed) "${entry.number} • Missed Call" else entry.number
                 } else {
                     when (entry.type) {
                         CallLog.Calls.OUTGOING_TYPE -> "Outgoing Call"
