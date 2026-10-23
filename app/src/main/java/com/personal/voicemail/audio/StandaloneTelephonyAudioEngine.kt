@@ -160,32 +160,35 @@ class StandaloneTelephonyAudioEngine {
             synchronized(activePlaybackTracks) {
                 activePlaybackTracks.clear()
 
-                val signallingAttrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-
-                buildTrack(signallingAttrs, targetDevice)?.let { tSig ->
-                    tSig.setVolume(1.0f)
-                    tSig.play()
-                    activePlaybackTracks.add(tSig)
+                val track = if (hasDigitalPrivilege) {
+                    buildTrack(buildCallAssistantAttributes(), targetDevice)
+                        ?: buildTrack(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build(),
+                            targetDevice
+                        )
+                } else {
+                    buildTrack(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build(),
+                        targetDevice
+                    ) ?: buildTrack(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build(),
+                        targetDevice
+                    )
                 }
 
-                buildTrack(buildCallAssistantAttributes(), targetDevice)?.let { tAssist ->
-                    tAssist.setVolume(1.0f)
-                    tAssist.play()
-                    activePlaybackTracks.add(tAssist)
-                }
-
-                val voiceAttrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-
-                buildTrack(voiceAttrs, earpieceDevice ?: targetDevice)?.let { tVoice ->
-                    tVoice.setVolume(1.0f)
-                    tVoice.play()
-                    activePlaybackTracks.add(tVoice)
+                track?.let { t ->
+                    t.setVolume(1.0f)
+                    t.play()
+                    activePlaybackTracks.add(t)
                 }
             }
 
@@ -201,8 +204,17 @@ class StandaloneTelephonyAudioEngine {
 
             // Pre-fill buffer before playback loop
             synchronized(activePlaybackTracks) {
-                for (t in activePlaybackTracks) {
-                    runCatching { t.write(pcmPayload, 0, minOf(trackBufferSize, pcmPayload.size)) }
+                val iterator = activePlaybackTracks.iterator()
+                while (iterator.hasNext()) {
+                    val t = iterator.next()
+                    val written = runCatching {
+                        t.write(pcmPayload, 0, minOf(trackBufferSize, pcmPayload.size))
+                    }.getOrDefault(-1)
+                    if (written < 0) {
+                        Log.w(TAG, "AudioTrack prefill write failed ($written); removing track")
+                        runCatching { t.stop(); t.release() }
+                        iterator.remove()
+                    }
                 }
             }
 
@@ -212,17 +224,35 @@ class StandaloneTelephonyAudioEngine {
                 if (audioManager.isSpeakerphoneOn) {
                     audioManager.isSpeakerphoneOn = false
                 }
+                var tracksAlive = false
                 synchronized(activePlaybackTracks) {
                     val iterator = activePlaybackTracks.iterator()
                     while (iterator.hasNext()) {
                         val t = iterator.next()
+                        if (t.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                            runCatching { t.play() }
+                        }
                         if (t.routedDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
                             runCatching { t.pause(); t.flush(); t.stop(); t.release() }
                             iterator.remove()
                             continue
                         }
-                        runCatching { t.write(pcmPayload, offset, len, AudioTrack.WRITE_NON_BLOCKING) }
+                        val written = runCatching {
+                            t.write(pcmPayload, offset, len, AudioTrack.WRITE_NON_BLOCKING)
+                        }.getOrDefault(-1)
+
+                        if (written < 0) {
+                            Log.w(TAG, "AudioTrack write failed ($written); dropping dead track")
+                            runCatching { t.stop(); t.release() }
+                            iterator.remove()
+                        } else {
+                            tracksAlive = true
+                        }
                     }
+                }
+                if (!tracksAlive) {
+                    Log.w(TAG, "No active playback tracks; ending greeting playback early")
+                    break
                 }
                 offset += len
                 try {
@@ -298,17 +328,6 @@ class StandaloneTelephonyAudioEngine {
                 return try {
                     var record: AudioRecord? = null
                     try {
-                        val attrBuilder = AudioAttributes.Builder()
-                        val presetApplied = runCatching {
-                            HiddenApiBypass.invoke(
-                                AudioAttributes.Builder::class.java,
-                                attrBuilder,
-                                "setInternalCapturePreset",
-                                candidate.sourceId
-                            )
-                            true
-                        }.getOrDefault(false)
-
                         val recBuilder = AudioRecord.Builder()
                             .setAudioFormat(
                                 AudioFormat.Builder()
@@ -328,16 +347,29 @@ class StandaloneTelephonyAudioEngine {
                             )
                         }
 
-                        if (presetApplied) {
-                            runCatching {
+                        if (candidate.useInternalPreset && hasPrivilege) {
+                            val attrBuilder = AudioAttributes.Builder()
+                            val presetApplied = runCatching {
                                 HiddenApiBypass.invoke(
-                                    AudioRecord.Builder::class.java,
-                                    recBuilder,
-                                    "setAudioAttributes",
-                                    attrBuilder.build()
+                                    AudioAttributes.Builder::class.java,
+                                    attrBuilder,
+                                    "setInternalCapturePreset",
+                                    candidate.sourceId
                                 )
+                                true
+                            }.getOrDefault(false)
+
+                            if (presetApplied) {
+                                runCatching {
+                                    HiddenApiBypass.invoke(
+                                        AudioRecord.Builder::class.java,
+                                        recBuilder,
+                                        "setAudioAttributes",
+                                        attrBuilder.build()
+                                    )
+                                }
                             }
-                        } else if (candidate.sourceId != AUDIO_SOURCE_VOICE_DOWNLINK && candidate.sourceId != AUDIO_SOURCE_VOICE_CALL) {
+                        } else {
                             recBuilder.setAudioSource(candidate.sourceId)
                         }
 

@@ -47,6 +47,7 @@ object GreetingGenerator {
         val customGreeting = File(dir, CUSTOM_GREETING_FILE_NAME)
 
         if (customGreeting.exists() && customGreeting.length() > 44) {
+            stageToTmpIfPossible(customGreeting)
             return customGreeting
         }
 

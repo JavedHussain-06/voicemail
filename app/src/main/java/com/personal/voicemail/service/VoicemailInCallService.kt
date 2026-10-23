@@ -516,6 +516,20 @@ class VoicemailInCallService : InCallService() {
         }
 
         Log.i(TAG, "Using StandaloneTelephonyAudioEngine for greeting injection & downlink capture.")
+        greetingTimeoutJob?.cancel()
+        greetingTimeoutJob = serviceScope.launch {
+            delay(6500L)
+            if (!isGreetingFinished.get() && isVoicemailScreeningActive) {
+                Log.w(TAG, "Standalone greeting safety timeout (6.5s) reached; transitioning to SCREENING_LIVE_VOICEMAIL.")
+                onGreetingPlaybackFinished()
+                standaloneEngine.startCapture(this@VoicemailInCallService) { chunk ->
+                    if (isVoicemailScreeningActive && isGreetingFinished.get()) {
+                        transcriber.submitPcmChunk(chunk)
+                    }
+                }
+            }
+        }
+
         standaloneEngine.playGreeting(this@VoicemailInCallService) {
             mainHandler.post {
                 onGreetingPlaybackFinished()

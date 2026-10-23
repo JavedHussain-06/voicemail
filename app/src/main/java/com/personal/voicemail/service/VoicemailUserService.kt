@@ -251,17 +251,15 @@ class VoicemailUserService : IVoicemailAudioService.Stub {
     private fun executePhaseAGreetingInjection(greetingWavFd: AssetFileDescriptor?) {
         val am = audioManager ?: return
         val stagedTmpFile = File("/data/local/tmp/voicemail_greeting.wav")
-        if (!stagedTmpFile.exists() || stagedTmpFile.length() < 32000) {
-            greetingWavFd?.let { fd ->
-                runCatching {
-                    val pfd = fd.parcelFileDescriptor
-                    val inStream = if (pfd != null) ParcelFileDescriptor.AutoCloseInputStream(pfd.dup()) else fd.createInputStream()
-                    FileOutputStream(stagedTmpFile).use { fos ->
-                        inStream.copyTo(fos)
-                        fos.flush()
-                    }
-                    stagedTmpFile.setReadable(true, false)
+        greetingWavFd?.let { fd ->
+            runCatching {
+                val pfd = fd.parcelFileDescriptor
+                val inStream = if (pfd != null) ParcelFileDescriptor.AutoCloseInputStream(pfd.dup()) else fd.createInputStream()
+                FileOutputStream(stagedTmpFile).use { fos ->
+                    inStream.copyTo(fos)
+                    fos.flush()
                 }
+                stagedTmpFile.setReadable(true, false)
             }
         }
 
@@ -341,12 +339,12 @@ class VoicemailUserService : IVoicemailAudioService.Stub {
         for (t in activeTracks) { t.setVolume(1.0f); t.play() }
 
         val pcmPayload: ByteArray = try {
-            val rawBytes = if (stagedTmpFile.exists() && stagedTmpFile.length() > 44) {
-                stagedTmpFile.readBytes()
-            } else if (greetingWavFd != null) {
+            val rawBytes = if (greetingWavFd != null) {
                 val pfd = greetingWavFd.parcelFileDescriptor
                 val stream = if (pfd != null) ParcelFileDescriptor.AutoCloseInputStream(pfd.dup()) else greetingWavFd.createInputStream()
                 stream.use { it.readBytes() }
+            } else if (stagedTmpFile.exists() && stagedTmpFile.length() > 44) {
+                stagedTmpFile.readBytes()
             } else ByteArray(0)
             if (rawBytes.size > 44) rawBytes.copyOfRange(44, rawBytes.size) else ByteArray(targetSampleRate * 2)
         } catch (t: Throwable) {
