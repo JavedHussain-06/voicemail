@@ -87,13 +87,47 @@ object GreetingGenerator {
         } catch (t: Throwable) {}
     }
 
+    private const val PREFS_NAME = "greeting_prefs"
+    private const val KEY_CUSTOM_TEXT = "custom_greeting_text"
+
+    fun getSavedCustomGreetingText(context: Context): String? {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_CUSTOM_TEXT, null)
+    }
+
+    fun setSavedCustomGreetingText(context: Context, text: String?) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CUSTOM_TEXT, text)
+            .apply()
+    }
+
+    fun isUsingCustomGreeting(context: Context): Boolean {
+        val dir = File(context.filesDir, GREETING_DIR_NAME)
+        val customGreeting = File(dir, CUSTOM_GREETING_FILE_NAME)
+        return customGreeting.exists() && customGreeting.length() > 44
+    }
+
+    fun resetToDefaultGreeting(context: Context): Boolean {
+        val dir = File(context.filesDir, GREETING_DIR_NAME)
+        val customGreeting = File(dir, CUSTOM_GREETING_FILE_NAME)
+        setSavedCustomGreetingText(context, null)
+        val deleted = if (customGreeting.exists()) customGreeting.delete() else true
+        getActiveGreetingFile(context)
+        return deleted
+    }
+
     fun getGreetingAssetFileDescriptor(context: Context): AssetFileDescriptor {
         val file = getActiveGreetingFile(context)
         val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
         return AssetFileDescriptor(pfd, 0, file.length())
     }
 
-    fun generateVoiceGreetingTts(context: Context, onComplete: ((Boolean) -> Unit)? = null) {
+    fun generateVoiceGreetingTts(
+        context: Context,
+        customText: String? = null,
+        onComplete: ((Boolean) -> Unit)? = null
+    ) {
         if (isGeneratingTts) {
             onComplete?.invoke(false)
             return
@@ -101,6 +135,9 @@ object GreetingGenerator {
         isGeneratingTts = true
 
         val appContext = context.applicationContext
+        val isCustom = !customText.isNullOrBlank()
+        val textToSynthesize = if (isCustom) customText!!.trim() else GREETING_SPOKEN_TEXT
+
         val mainHandler = Handler(Looper.getMainLooper())
 
         mainHandler.post {
@@ -124,7 +161,10 @@ object GreetingGenerator {
                             override fun onStart(id: String?) {}
                             override fun onDone(id: String?) {
                                 try {
-                                    val success = processTtsWavTo16kWithBeep(tempTtsFile, appContext)
+                                    val success = processTtsWavTo16kWithBeep(tempTtsFile, appContext, isCustom = isCustom)
+                                    if (success && isCustom) {
+                                        setSavedCustomGreetingText(appContext, textToSynthesize)
+                                    }
                                     isGeneratingTts = false
                                     engine.shutdown()
                                     onComplete?.invoke(success)
@@ -154,7 +194,7 @@ object GreetingGenerator {
                             putFloat(TextToSpeech.Engine.KEY_PARAM_PAN, 0.0f)
                         }
 
-                        engine.synthesizeToFile(GREETING_SPOKEN_TEXT, params, tempTtsFile, utteranceId)
+                        engine.synthesizeToFile(textToSynthesize, params, tempTtsFile, utteranceId)
                     } catch (t: Throwable) {
                         isGeneratingTts = false
                         engine.shutdown()
@@ -165,7 +205,7 @@ object GreetingGenerator {
         }
     }
 
-    private fun processTtsWavTo16kWithBeep(sourceWav: File, context: Context): Boolean {
+    private fun processTtsWavTo16kWithBeep(sourceWav: File, context: Context, isCustom: Boolean = false): Boolean {
         if (!sourceWav.exists() || sourceWav.length() < 44) return false
         val fileBytes = sourceWav.readBytes()
         if (fileBytes.size < 44) return false
@@ -262,8 +302,12 @@ object GreetingGenerator {
         for (s in beepSamples) buf.putShort(s)
         for (s in tailSamples) buf.putShort(0)
 
-        val targetFile = File(context.filesDir, DEFAULT_GREETING_FILE_NAME)
         val dir = File(context.filesDir, GREETING_DIR_NAME).apply { mkdirs() }
+        val targetFile = if (isCustom) {
+            File(dir, CUSTOM_GREETING_FILE_NAME)
+        } else {
+            File(context.filesDir, DEFAULT_GREETING_FILE_NAME)
+        }
         val dirGreeting = File(dir, DEFAULT_GREETING_FILE_NAME)
         val versionMarker = File(dir, GREETING_VERSION_MARKER)
 
@@ -273,10 +317,12 @@ object GreetingGenerator {
             fos.flush()
         }
 
-        runCatching { targetFile.copyTo(dirGreeting, overwrite = true) }
-        runCatching { versionMarker.writeText("v2_normalized") }
+        if (!isCustom) {
+            runCatching { targetFile.copyTo(dirGreeting, overwrite = true) }
+            runCatching { versionMarker.writeText("v2_normalized") }
+        }
         stageToTmpIfPossible(targetFile)
-        return targetFile.length() > 64000
+        return targetFile.length() > 32000
     }
 
     fun generateImmediateFallbackGreeting(outputFile: File) {

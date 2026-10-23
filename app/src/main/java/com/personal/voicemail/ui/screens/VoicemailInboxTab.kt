@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Voicemail
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -47,6 +48,8 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
@@ -480,9 +483,20 @@ fun CustomGreetingDialog(
 ) {
     val context = LocalContext.current
     var isPlayingGreeting by remember { mutableStateOf(false) }
-    var isRegenerating by remember { mutableStateOf(false) }
+    var isSynthesizing by remember { mutableStateOf(false) }
     var activePlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var fileRefreshTrigger by remember { mutableIntStateOf(0) }
+
+    val savedCustomText = remember(fileRefreshTrigger) {
+        GreetingGenerator.getSavedCustomGreetingText(context)
+    }
+    val isCustomActive = remember(fileRefreshTrigger) {
+        GreetingGenerator.isUsingCustomGreeting(context)
+    }
+
+    var greetingInputText by remember(savedCustomText) {
+        mutableStateOf(savedCustomText ?: GreetingGenerator.GREETING_SPOKEN_TEXT)
+    }
 
     val greetingFile = remember(fileRefreshTrigger) {
         GreetingGenerator.getActiveGreetingFile(context)
@@ -516,7 +530,7 @@ fun CustomGreetingDialog(
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
-                    text = "Voicemail Voice Greeting",
+                    text = "Voicemail Greeting",
                     fontWeight = FontWeight.Bold,
                     fontSize = 18.sp,
                     color = TextPrimary
@@ -529,55 +543,64 @@ fun CustomGreetingDialog(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "This spoken message is injected into the cellular uplink when Live Voicemail screens an incoming call.",
+                    text = "This greeting is played to callers before asking them to leave a voicemail message.",
                     fontSize = 13.sp,
                     color = TextSecondary
                 )
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
-                // Greeting File Status Card
-                Box(
+                // Active Status Badge
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(GlassSurface)
-                        .border(1.dp, GlassBorder, RoundedCornerShape(16.dp))
-                        .padding(14.dp)
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = "File: ${greetingFile.name}",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = TextPrimary
-                            )
-                            Text(
-                                text = "${fileSizeKb} KB • ${durationSec}s",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = AccentBlue
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Text(
-                            text = "\"${GreetingGenerator.GREETING_SPOKEN_TEXT}\"",
-                            fontSize = 12.sp,
-                            color = TextSecondary,
-                            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (isCustomActive) Color(0x3334C759) else Color(0x33007AFF)
                         )
-                    }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (isCustomActive) "Active: Custom Greeting" else "Active: Default Greeting",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isCustomActive) Color(0xFF34C759) else AccentBlue
+                    )
+                    Text(
+                        text = "${fileSizeKb} KB • ${durationSec}s",
+                        fontSize = 11.sp,
+                        color = TextSecondary
+                    )
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
-                // 1. Play Greeting Out Loud Button
+                // Editable Greeting Message Field
+                OutlinedTextField(
+                    value = greetingInputText,
+                    onValueChange = { greetingInputText = it },
+                    label = { Text("Spoken Greeting Message", fontSize = 12.sp) },
+                    placeholder = { Text("Enter your greeting message...") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(110.dp),
+                    maxLines = 4,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AccentBlue,
+                        unfocusedBorderColor = GlassBorder,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary,
+                        focusedContainerColor = GlassSurface,
+                        unfocusedContainerColor = GlassSurface
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 1. Play Current Greeting Out Loud
                 Button(
                     onClick = {
                         if (isPlayingGreeting) {
@@ -606,59 +629,93 @@ fun CustomGreetingDialog(
                         }
                     },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isPlayingGreeting) CallEndRed else AccentBlue
+                        containerColor = if (isPlayingGreeting) CallEndRed else GlassSurface
                     ),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, GlassBorder, RoundedCornerShape(12.dp))
                 ) {
                     Icon(
                         imageVector = if (isPlayingGreeting) Icons.Default.Stop else Icons.Default.PlayArrow,
                         contentDescription = null,
-                        tint = Color.White,
+                        tint = if (isPlayingGreeting) Color.White else AccentBlue,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isPlayingGreeting) "Stop Playback" else "Play Greeting Out Loud",
-                        fontWeight = FontWeight.Bold,
+                        text = if (isPlayingGreeting) "Stop Playback" else "Play Greeting (${durationSec}s)",
+                        fontWeight = FontWeight.SemiBold,
                         color = Color.White
                     )
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
-                // 2. Regenerate Voice Greeting Button (TTS)
+                // 2. Save & Synthesize Custom Greeting
                 Button(
                     onClick = {
                         activePlayer?.stop()
                         activePlayer?.release()
                         activePlayer = null
                         isPlayingGreeting = false
-                        isRegenerating = true
-                        GreetingGenerator.generateVoiceGreetingTts(context) { success ->
-                            isRegenerating = false
+                        isSynthesizing = true
+                        GreetingGenerator.generateVoiceGreetingTts(
+                            context = context,
+                            customText = greetingInputText
+                        ) { success ->
+                            isSynthesizing = false
                             fileRefreshTrigger++
                         }
                     },
-                    enabled = !isRegenerating,
-                    colors = ButtonDefaults.buttonColors(containerColor = GlassSurface),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, GlassBorder, RoundedCornerShape(14.dp))
+                    enabled = !isSynthesizing && greetingInputText.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(
                         imageVector = Icons.Default.RecordVoiceOver,
                         contentDescription = null,
-                        tint = AccentBlue,
+                        tint = Color.White,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isRegenerating) "Synthesizing Voice…" else "Regenerate Voice Greeting (TTS)",
-                        fontWeight = FontWeight.SemiBold,
+                        text = if (isSynthesizing) "Synthesizing Voice..." else "Save & Synthesize Greeting",
+                        fontWeight = FontWeight.Bold,
                         color = Color.White
                     )
+                }
+
+                // 3. Reset to Default Button (Visible if custom greeting is currently active)
+                if (isCustomActive) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(
+                        onClick = {
+                            activePlayer?.stop()
+                            activePlayer?.release()
+                            activePlayer = null
+                            isPlayingGreeting = false
+                            GreetingGenerator.resetToDefaultGreeting(context)
+                            greetingInputText = GreetingGenerator.GREETING_SPOKEN_TEXT
+                            fileRefreshTrigger++
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RestartAlt,
+                            contentDescription = null,
+                            tint = Color(0xFFFF453A),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Reset to Default Telecom Greeting",
+                            color = Color(0xFFFF453A),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
             }
         },
@@ -671,9 +728,9 @@ fun CustomGreetingDialog(
                     onDismiss()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = GlassSurface),
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(10.dp)
             ) {
-                Text(text = "Close", color = Color.White)
+                Text(text = "Done", color = Color.White)
             }
         },
         containerColor = Color(0xFF1C1C22),
