@@ -1,14 +1,17 @@
 package com.personal.voicemail.service
 
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.CallLog
 import android.provider.ContactsContract
 import android.telecom.Call
 import android.telecom.CallAudioState
@@ -16,6 +19,7 @@ import android.telecom.InCallService
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telecom.VideoProfile
+import android.telephony.PhoneNumberUtils
 import android.telephony.SubscriptionManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -654,6 +658,12 @@ class VoicemailInCallService : InCallService() {
 
         val wasScreening = isVoicemailScreeningActive || isScreeningSessionRunning.get()
         val wasGreetingPlaying = !isGreetingFinished.get()
+        val callNumber = activeCall?.details?.handle?.schemeSpecificPart
+            ?.let(Uri::decode)
+            ?.takeIf { it.isNotBlank() }
+            ?: TelecomCallManager.phoneNumber.value
+        val callStartTimeMs = activeCall?.details?.creationTimeMillis?.takeIf { it > 0L }
+            ?: System.currentTimeMillis()
 
         isVoicemailScreeningActive = false
         isScreeningSessionRunning.set(false)
@@ -672,6 +682,9 @@ class VoicemailInCallService : InCallService() {
         appScope.launch(NonCancellable) {
             try {
                 if (wasScreening) {
+                    if (!isPickedUp) {
+                        markScreenedCallAsMissed(callNumber, callStartTimeMs)
+                    }
                     val voicemail = transcriber.stopSession(isPickedUp = isPickedUp, saveToRepository = true)
                     if (voicemail != null) {
                         if (wasGreetingPlaying && !isPickedUp) {
@@ -930,6 +943,114 @@ class VoicemailInCallService : InCallService() {
             displayName to slotIndex
         } catch (t: Throwable) {
             "SIM 1" to 0
+        }
+    }
+
+    /**
+     * Telecom has to answer a call before this app can screen it, so Android may initially
+     * record it as answered. A caller handled only by voicemail is still a missed call for
+     * the user; change Telecom's row after disconnect. Calls the user takes over stay answered.
+     */
+    private fun markScreenedCallAsMissed(phoneNumber: String, callStartTimeMs: Long) {
+        if (checkSelfPermission(android.Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "Can't mark screened call as missed: WRITE_CALL_LOG isn't granted")
+            return
+        }
+
+        val cleanTarget = phoneNumber.filter { it.isDigit() || it == '+' }
+        val targetStart = callStartTimeMs.takeIf { it > 0L } ?: System.currentTimeMillis()
+        val from = (targetStart - 2 * 60_000L).coerceAtLeast(0L).toString()
+        val through = (targetStart + 2 * 60_000L).toString()
+
+        appScope.launch {
+            var updated = false
+
+            // Telecom can write its CallLog row just after onCallRemoved. Retry briefly first.
+            for (attempt in 0 until 5) {
+                delay(if (attempt == 0) 350L else 700L)
+                try {
+                    val projection = arrayOf(
+                        CallLog.Calls._ID,
+                        CallLog.Calls.NUMBER,
+                        CallLog.Calls.DATE,
+                        CallLog.Calls.TYPE
+                    )
+                    contentResolver.query(
+                        CallLog.Calls.CONTENT_URI,
+                        projection,
+                        "${CallLog.Calls.DATE} BETWEEN ? AND ?",
+                        arrayOf(from, through),
+                        "${CallLog.Calls.DATE} DESC"
+                    )?.use { cursor ->
+                        val idColumn = cursor.getColumnIndexOrThrow(CallLog.Calls._ID)
+                        val numberColumn = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+                        val typeColumn = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+
+                        while (cursor.moveToNext()) {
+                            val loggedNumber = cursor.getString(numberColumn).orEmpty()
+                            val loggedDigits = loggedNumber.filter(Char::isDigit)
+                            val targetDigits = cleanTarget.filter(Char::isDigit)
+                            val matchesNumber = if (targetDigits.isBlank()) {
+                                loggedNumber.isBlank() || loggedNumber == "-1"
+                            } else {
+                                PhoneNumberUtils.compare(phoneNumber, loggedNumber) ||
+                                    (targetDigits.length >= 7 && loggedDigits.length >= 7 &&
+                                        (targetDigits.endsWith(loggedDigits) || loggedDigits.endsWith(targetDigits)))
+                            }
+                            if (!matchesNumber) continue
+
+                            val type = cursor.getInt(typeColumn)
+                            if (type == CallLog.Calls.MISSED_TYPE) {
+                                updated = true
+                                break
+                            }
+                            if (type != CallLog.Calls.INCOMING_TYPE &&
+                                type != CallLog.Calls.ANSWERED_EXTERNALLY_TYPE
+                            ) continue
+
+                            val values = ContentValues().apply {
+                                put(CallLog.Calls.TYPE, CallLog.Calls.MISSED_TYPE)
+                                put(CallLog.Calls.DURATION, 0)
+                                put(CallLog.Calls.NEW, 1)
+                                put(CallLog.Calls.IS_READ, 0)
+                            }
+                            val rows = contentResolver.update(
+                                CallLog.Calls.CONTENT_URI,
+                                values,
+                                "${CallLog.Calls._ID} = ?",
+                                arrayOf(cursor.getLong(idColumn).toString())
+                            )
+                            updated = rows > 0
+                            if (updated) {
+                                Log.i(TAG, "Marked voicemail-screened call from $loggedNumber as missed")
+                                break
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not update screened call in CallLog: ${t.message}")
+                }
+
+                if (updated) return@launch
+            }
+
+            // If Telecom never created a row, add one so the voicemail still appears in Recents.
+            if (cleanTarget.isNotBlank()) {
+                try {
+                    val values = ContentValues().apply {
+                        put(CallLog.Calls.NUMBER, phoneNumber)
+                        put(CallLog.Calls.DATE, targetStart)
+                        put(CallLog.Calls.DURATION, 0)
+                        put(CallLog.Calls.TYPE, CallLog.Calls.MISSED_TYPE)
+                        put(CallLog.Calls.NEW, 1)
+                        put(CallLog.Calls.IS_READ, 0)
+                    }
+                    val uri = contentResolver.insert(CallLog.Calls.CONTENT_URI, values)
+                    Log.i(TAG, "Inserted missed-call history row for screened call (uri=$uri)")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not add screened call to CallLog: ${t.message}")
+                }
+            }
         }
     }
 }
